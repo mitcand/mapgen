@@ -102,8 +102,8 @@ config <- list(
   # === OUTPUT ===
   output_dir = "output",                # Directory for saved images
   output_format = "png",                # Format: "png", "pdf", or "jpg"
-  output_width = 12,                    # Image width in inches
-  output_height = 10,                   # Image height in inches
+  output_width = 16,                    # Image width in inches (map expands to fill)
+  output_height = 9,                    # Image height in inches (16:9 default)
   output_dpi = 300                      # Resolution (300 = print quality)
 )
 
@@ -579,9 +579,14 @@ choose_projection <- function(points_sf, country_filter = NULL, projection_overr
 
 choose_projection_from_bbox <- function(bbox, country_filter = NULL, projection_override = NULL) {
   
-  # If override specified, use it
-  center_lon <- (bbox["xmin"] + bbox["xmax"]) / 2
-  center_lat <- (bbox["ymin"] + bbox["ymax"]) / 2
+  # Extract bbox values as plain numbers
+  xmin <- as.numeric(bbox["xmin"])
+  xmax <- as.numeric(bbox["xmax"])
+  ymin <- as.numeric(bbox["ymin"])
+  ymax <- as.numeric(bbox["ymax"])
+  
+  center_lon <- (xmin + xmax) / 2
+  center_lat <- (ymin + ymax) / 2
   
   if (!is.null(projection_override)) {
     proj_string <- switch(projection_override,
@@ -604,8 +609,12 @@ choose_projection_from_bbox <- function(bbox, country_filter = NULL, projection_
     
     if (nrow(country) > 0) {
       bbox <- st_bbox(country)
-      center_lon <- (bbox["xmin"] + bbox["xmax"]) / 2
-      center_lat <- (bbox["ymin"] + bbox["ymax"]) / 2
+      xmin <- as.numeric(bbox["xmin"])
+      xmax <- as.numeric(bbox["xmax"])
+      ymin <- as.numeric(bbox["ymin"])
+      ymax <- as.numeric(bbox["ymax"])
+      center_lon <- (xmin + xmax) / 2
+      center_lat <- (ymin + ymax) / 2
       cli_alert_info("Using country extent for projection: {country_filter}")
     } else {
       cli_alert_warning("Country code '{country_filter}' not found, using data extent")
@@ -613,11 +622,11 @@ choose_projection_from_bbox <- function(bbox, country_filter = NULL, projection_
   }
   
   # Calculate extent characteristics
-  lon_span <- bbox["xmax"] - bbox["xmin"]
-  lat_span <- bbox["ymax"] - bbox["ymin"]
+  lon_span <- xmax - xmin
+  lat_span <- ymax - ymin
   
   # Adjust lon_span for wrapping if needed
-  if (lon_span > 180) {
+  if (!is.na(lon_span) && lon_span > 180) {
     lon_span <- 360 - lon_span
   }
   
@@ -628,16 +637,27 @@ choose_projection_from_bbox <- function(bbox, country_filter = NULL, projection_
   # Small regional (< 30° span): Lambert Azimuthal Equal Area - best for small areas, equal area
   # Medium regional (30-60° span): Albers Equal Area Conic - good for mid-latitudes, equal area
   # Large/continental (60-120° span): Winkel Tripel - good balance of distortions
-
   # Global/multi-continental (> 120° span): Robinson or Mercator
   #
   # Special cases:
-  # - High latitudes (>60° or <-60°): Stereographic polar
-  # - Equatorial regions with large lon span: Mercator works well
+  # - High latitudes (>65° or <-65°): Use LAEA to avoid conic projection issues
+  # - Data extending to polar regions: Use LAEA
+  # - Very large latitude span (>50°): Use LAEA or Winkel Tripel
   
   max_span <- max(lon_span, lat_span)
+  max_lat <- max(abs(ymin), abs(ymax))
   
-  if (max_span < 30) {
+  # Check for high-latitude data that would break conic projections
+  is_polar_adjacent <- max_lat > 65
+  is_large_lat_span <- lat_span > 50
+  
+  if (is_polar_adjacent || is_large_lat_span) {
+    # Use LAEA for anything touching polar regions or spanning huge latitude ranges
+    # LAEA handles all latitudes gracefully
+    proj_string <- glue("+proj=laea +lat_0={center_lat} +lon_0={center_lon} +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs")
+    proj_name <- "Lambert Azimuthal Equal Area (high latitude/large extent)"
+    
+  } else if (max_span < 30) {
     # Small regional - Lambert Azimuthal Equal Area
     proj_string <- glue("+proj=laea +lat_0={center_lat} +lon_0={center_lon} +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs")
     proj_name <- "Lambert Azimuthal Equal Area (regional)"
@@ -861,44 +881,75 @@ create_heatmap <- function(hex_data, projection, config, country_filter = NULL,
                            extent_buffer_km = 50, title = NULL) {
   cli_alert("Creating heatmap...")
   
-  # Get basemap - country borders from Natural Earth
-  world <- ne_countries(scale = 50, returnclass = "sf")
-  
-  # Transform everything to chosen projection
-  hex_proj <- st_transform(hex_data, projection)
-  world_proj <- st_transform(world, projection)
-  
   # Separate hexes with clipmarks for border overlay
-  hex_with_clips <- hex_proj[hex_proj$has_clipmark == TRUE, ]
+  hex_with_clips <- hex_data[hex_data$has_clipmark == TRUE, ]
   n_clipmark_hexes <- nrow(hex_with_clips)
   
-  # Determine plot extent
-  if (!is.null(country_filter)) {
-    country_boundary <- get_country_boundary(country_filter)
-    if (!is.null(country_boundary)) {
-      country_proj <- st_transform(country_boundary, projection)
-      plot_bbox <- st_bbox(country_proj)
-      
-      # Add buffer
-      buffer_m <- extent_buffer_km * 1000
-      plot_bbox["xmin"] <- plot_bbox["xmin"] - buffer_m
-      plot_bbox["ymin"] <- plot_bbox["ymin"] - buffer_m
-      plot_bbox["xmax"] <- plot_bbox["xmax"] + buffer_m
-      plot_bbox["ymax"] <- plot_bbox["ymax"] + buffer_m
-    } else {
-      plot_bbox <- st_bbox(hex_proj)
-    }
+  # Transform hex data to projected CRS
+  hex_proj <- st_transform(hex_data, projection)
+  hex_with_clips_proj <- if (n_clipmark_hexes > 0) st_transform(hex_with_clips, projection) else NULL
+  
+  # Get extent in projected coordinates using trimmed data (1st-99th percentile)
+  hex_coords <- suppressWarnings(st_coordinates(st_centroid(hex_proj)))
+  
+  x_quantiles <- quantile(hex_coords[, "X"], probs = c(0.01, 0.99), na.rm = TRUE)
+  y_quantiles <- quantile(hex_coords[, "Y"], probs = c(0.01, 0.99), na.rm = TRUE)
+  
+  # Start with trimmed extent in projected coordinates
+  xmin <- as.numeric(x_quantiles[1])
+  xmax <- as.numeric(x_quantiles[2])
+  ymin <- as.numeric(y_quantiles[1])
+  ymax <- as.numeric(y_quantiles[2])
+  
+  # Add buffer (in meters since projected)
+  buffer_m <- extent_buffer_km * 1000
+  x_range <- xmax - xmin
+  y_range <- ymax - ymin
+  context_buffer <- max(x_range, y_range) * 0.15
+  total_buffer <- buffer_m + context_buffer
+  
+  xmin <- xmin - total_buffer
+  xmax <- xmax + total_buffer
+  ymin <- ymin - total_buffer
+  ymax <- ymax + total_buffer
+  
+  # Expand extent to match output aspect ratio
+  output_aspect <- config$output_width / config$output_height
+  
+  current_x_range <- xmax - xmin
+  current_y_range <- ymax - ymin
+  current_aspect <- current_x_range / current_y_range
+  
+  if (current_aspect < output_aspect) {
+    # Need to expand x (make wider)
+    target_x_range <- current_y_range * output_aspect
+    expand_x <- (target_x_range - current_x_range) / 2
+    xmin <- xmin - expand_x
+    xmax <- xmax + expand_x
   } else {
-    plot_bbox <- st_bbox(hex_proj)
-    # Add buffer
-    x_range <- plot_bbox["xmax"] - plot_bbox["xmin"]
-    y_range <- plot_bbox["ymax"] - plot_bbox["ymin"]
-    buffer <- max(x_range, y_range) * 0.1
-    plot_bbox["xmin"] <- plot_bbox["xmin"] - buffer
-    plot_bbox["ymin"] <- plot_bbox["ymin"] - buffer
-    plot_bbox["xmax"] <- plot_bbox["xmax"] + buffer
-    plot_bbox["ymax"] <- plot_bbox["ymax"] + buffer
+    # Need to expand y (make taller)
+    target_y_range <- current_x_range / output_aspect
+    expand_y <- (target_y_range - current_y_range) / 2
+    ymin <- ymin - expand_y
+    ymax <- ymax + expand_y
   }
+  
+  # Get basemap and transform to projected CRS
+  cli_alert("Loading basemap...")
+  world <- ne_countries(scale = 50, returnclass = "sf")
+  
+  # Transform world to projection (will clip to extent during plotting)
+  world_proj <- tryCatch({
+    sf_use_s2_setting <- sf::sf_use_s2()
+    sf::sf_use_s2(FALSE)
+    on.exit(sf::sf_use_s2(sf_use_s2_setting), add = TRUE)
+    
+    result <- st_transform(st_make_valid(world), projection)
+    st_make_valid(result)
+  }, error = function(e) {
+    cli_alert_warning("Basemap transform failed: {e$message}")
+    st_transform(world, projection)
+  })
   
   # Generate title if not provided
   if (is.null(title)) {
@@ -915,18 +966,15 @@ create_heatmap <- function(hex_data, projection, config, country_filter = NULL,
     colors <- viridis::plasma(n_categories, begin = 0.1, end = 0.9)
   }
   
-  # Create plot
+  # Create plot in projected coordinates
   p <- ggplot() +
-    # Water background (entire panel)
-    theme(panel.background = element_rect(fill = config$water_color, color = NA)) +
-    
     # Land polygons with country borders
     geom_sf(data = world_proj, 
             fill = config$land_color, 
             color = config$border_color, 
             linewidth = config$border_width) +
     
-    # Hex bins (all)
+    # Hex bins
     geom_sf(data = hex_proj, aes(fill = dwell_category), color = NA, alpha = 0.85) +
     
     # Hex outlines - subtle for definition
@@ -934,7 +982,7 @@ create_heatmap <- function(hex_data, projection, config, country_filter = NULL,
     
     # Clipmark hex borders
     {if (n_clipmark_hexes > 0) 
-      geom_sf(data = hex_with_clips, fill = NA, 
+      geom_sf(data = hex_with_clips_proj, fill = NA, 
               color = config$clipmark_border_color, 
               linewidth = config$clipmark_border_width)
     } +
@@ -946,11 +994,12 @@ create_heatmap <- function(hex_data, projection, config, country_filter = NULL,
       drop = FALSE
     ) +
     
-    # Extent
+    # Extent in projected coordinates - no default_crs needed
     coord_sf(
-      xlim = c(plot_bbox["xmin"], plot_bbox["xmax"]),
-      ylim = c(plot_bbox["ymin"], plot_bbox["ymax"]),
-      expand = FALSE
+      xlim = c(xmin, xmax),
+      ylim = c(ymin, ymax),
+      expand = FALSE,
+      datum = sf::st_crs(projection)  # Use projection for graticule
     ) +
     
     # Labels
@@ -962,18 +1011,22 @@ create_heatmap <- function(hex_data, projection, config, country_filter = NULL,
       )
     ) +
     
-    # Theme
+    # Theme - minimal margins to fill frame
     theme_minimal() +
     theme(
       panel.background = element_rect(fill = config$water_color, color = NA),
       panel.grid = element_line(color = "#2a4a6a", linewidth = 0.2),
-      legend.position = "right",
-      legend.background = element_rect(fill = "white", color = "gray80"),
+      legend.position = c(0.98, 0.5),  # Legend inside plot on right
+      legend.justification = c(1, 0.5),
+      legend.background = element_rect(fill = alpha("white", 0.9), color = "gray80"),
       legend.text = element_text(size = 9),
       legend.title = element_text(size = 10, face = "bold"),
-      plot.title = element_text(size = 14, face = "bold"),
-      plot.subtitle = element_text(size = 10, color = "gray40"),
-      plot.background = element_rect(fill = "white", color = NA)
+      legend.key.size = unit(0.8, "lines"),
+      plot.title = element_text(size = 14, face = "bold", margin = margin(0, 0, 2, 0)),
+      plot.subtitle = element_text(size = 10, color = "gray40", margin = margin(0, 0, 5, 0)),
+      plot.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(5, 5, 5, 5),
+      axis.text = element_text(size = 8)
     )
   
   return(p)
@@ -1063,14 +1116,19 @@ run_analysis <- function(config, col_map) {
     return(NULL)
   }
   
-  # Choose projection (use data extent directly for speed)
+  # Choose projection (use trimmed data extent to avoid outliers affecting projection choice)
+  # Use 1st/99th percentile instead of min/max
+  lat_q <- quantile(frame_data$lat, probs = c(0.01, 0.99), na.rm = TRUE)
+  lon_q <- quantile(frame_data$lon, probs = c(0.01, 0.99), na.rm = TRUE)
+  
   data_bbox <- c(
-    xmin = min(frame_data$lon),
-    ymin = min(frame_data$lat),
-    xmax = max(frame_data$lon),
-    ymax = max(frame_data$lat)
+    xmin = as.numeric(lon_q[1]),
+    ymin = as.numeric(lat_q[1]),
+    xmax = as.numeric(lon_q[2]),
+    ymax = as.numeric(lat_q[2])
   )
   class(data_bbox) <- "bbox"
+  attr(data_bbox, "crs") <- st_crs(4326)
   projection <- choose_projection_from_bbox(data_bbox, config$country_filter, config$projection_override)
   
   # Bin dwell times using fast grid method
