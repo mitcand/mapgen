@@ -20,13 +20,15 @@ A tool for visualizing camera dwell time patterns from high-altitude aircraft sc
 ## Overview
 
 This script analyzes 15 Hz camera metadata logs to create heatmaps showing:
-- **Dwell time**: How long the camera looked at each area (measured in hex bins)
+- **Camera frame center dwell time**: Where the camera was looking and for how long
+- **Aircraft position dwell time**: Where the aircraft was flying and for how long
 - **Crew interest**: Areas where the crew marked points of interest (highlighted with cyan borders)
 
-The hex bins are colored by dwell time category, allowing you to quickly see which areas received the most attention during a mission or time period.
+Each run generates **two maps**: one for camera frame centers and one for aircraft position, allowing you to compare where the aircraft flew versus where the camera was pointed.
 
 ### Key Features
 
+- **Dual heatmaps**: Generates both frame center and aircraft position maps per run
 - **Fast processing**: Uses H3 hexagonal indexing (~20 seconds for 35M points)
 - **Flexible queries**: Filter by mission ID(s) or date range
 - **Smart projections**: Auto-selects appropriate map projection based on data extent
@@ -34,6 +36,15 @@ The hex bins are colored by dwell time category, allowing you to quickly see whi
 - **Outlier handling**: Uses trimmed extent (1st-99th percentile) to prevent transit legs from stretching the map
 - **Configurable styling**: Colors, hex size, time buckets all adjustable
 - **DuckDB backend**: Efficient handling of large CSV datasets (20-30GB+)
+
+### Frame Center vs Aircraft Position
+
+| Map Type | What It Shows | Use When... |
+|----------|---------------|-------------|
+| **Frame Center** | Where the camera was pointed | Analyzing crew interest and target coverage |
+| **Aircraft Position** | Where the aircraft flew | Analyzing flight patterns and route coverage |
+
+The two maps often look quite different because the camera is typically pointed off to the side of the aircraft, not straight down. Comparing them helps identify areas where the aircraft made multiple passes versus areas that received sustained camera attention.
 
 ---
 
@@ -46,14 +57,17 @@ source("hexbin_dwell_analysis.R")
 # 2. Generate test data (if you don't have real data yet)
 generate_synthetic_data(n_missions = 5)
 
-# 3. Run analysis
+# 3. Run analysis (generates TWO maps)
 result <- run_analysis(config, col_map)
 
-# 4. View the plot
-print(result$plot)
+# 4. View the plots
+print(result$plots$frame_center)  # Where the camera was looking
+print(result$plots$aircraft)       # Where the aircraft was flying
 
-# 5. Check output file location
-result$output_file
+# 5. Check output file locations
+result$output_files
+# $frame_center: "output/all_missions_..._framecenter.png"
+# $aircraft:     "output/all_missions_..._aircraft.png"
 ```
 
 ---
@@ -235,8 +249,10 @@ Place your CSV files in the `data_dir` folder. Files are identified by naming pa
 col_map <- list(
   # VUEFAST columns
   timestamp = "your_timestamp_column",
-  frame_lat = "your_frame_center_lat_column",
+  frame_lat = "your_frame_center_lat_column",   # Camera frame center
   frame_lon = "your_frame_center_lon_column",
+  aircraft_lat = "your_aircraft_lat_column",    # Aircraft position
+  aircraft_lon = "your_aircraft_lon_column",
   
   # CLIPMARKS columns (if using)
   clip_start_time = "your_start_time_column",
@@ -245,6 +261,8 @@ col_map <- list(
   clip_description = "your_description_column"
 )
 ```
+
+**Note**: If aircraft position columns are not available in your data, the script will generate only the frame center heatmap and skip the aircraft position map.
 
 ### Expected Data
 
@@ -321,30 +339,42 @@ result <- run_analysis(config, col_map)
 
 ## Output
 
+### Dual Map Output
+
+Each run generates **two heatmaps**:
+
+| Map Type | Filename Suffix | Shows |
+|----------|-----------------|-------|
+| Frame Center | `_framecenter.png` | Where the camera was looking |
+| Aircraft Position | `_aircraft.png` | Where the aircraft was flying |
+
 ### File Naming
 
 Output files are automatically named based on query parameters:
 
-| Query Type | Example Filename |
-|------------|------------------|
-| Specific missions | `M2024001_M2024002_20251126_143022.png` |
-| Date range | `20251126_143022_90days.png` |
-| All missions | `all_missions_20251126_143022.png` |
-| With country filter | `..._AZE.png` (appended) |
+| Query Type | Example Filenames |
+|------------|-------------------|
+| Specific missions | `M2024001_M2024002_20251126_143022_framecenter.png`<br>`M2024001_M2024002_20251126_143022_aircraft.png` |
+| Date range | `20251126_143022_90days_framecenter.png`<br>`20251126_143022_90days_aircraft.png` |
+| All missions | `all_missions_20251126_143022_framecenter.png`<br>`all_missions_20251126_143022_aircraft.png` |
+| With country filter | `..._AZE_framecenter.png` (appended) |
 
 ### Accessing Results
 
 ```r
 result <- run_analysis(config, col_map)
 
-# The ggplot object (for further customization)
-result$plot
+# The ggplot objects (for further customization)
+result$plots$frame_center    # Camera frame center heatmap
+result$plots$aircraft        # Aircraft position heatmap
 
-# Path to saved file
-result$output_file
+# Paths to saved files
+result$output_files$frame_center
+result$output_files$aircraft
 
-# Display the plot
-print(result$plot)
+# Display plots
+print(result$plots$frame_center)
+print(result$plots$aircraft)
 ```
 
 ---
@@ -521,4 +551,4 @@ For issues or questions:
 
 ---
 
-*Generated with Claude AI assistance - Version 1.1*
+*Generated with Claude AI assistance - Version 1.2*

@@ -49,7 +49,7 @@ config <- list(
  # === DATA SOURCE ===
   data_dir = "data/missions",           # Folder containing CSV files
   db_path = "missions.duckdb",          # DuckDB database path (created automatically)
-  use_existing_db = FALSE,              # TRUE = reuse existing DB, FALSE = reimport CSVs
+  use_existing_db = TRUE,              # TRUE = reuse existing DB, FALSE = reimport CSVs
   
   # === QUERY FILTERS ===
   # Use ONE of these approaches to filter data:
@@ -546,6 +546,66 @@ query_frame_centers <- function(con, config, col_map) {
   ")
   
   cli_alert_info("Querying frame centers...")
+  data <- dbGetQuery(con, query)
+  cli_alert_success("Retrieved {format(nrow(data), big.mark=',')} points")
+  
+  # Remove invalid coordinates
+  data <- data[!is.na(data$lat) & !is.na(data$lon) & 
+               data$lat >= -90 & data$lat <= 90 &
+               data$lon >= -180 & data$lon <= 180, ]
+  
+  return(data)
+}
+
+query_aircraft_positions <- function(con, config, col_map) {
+  #' Query aircraft position data (where the aircraft was flying)
+  #' 
+  #' @param con DuckDB connection
+
+  #' @param config Configuration list
+  #' @param col_map Column mapping list
+  #' @return Data frame with lat/lon columns
+  
+  # Check if aircraft position columns exist
+  table_info <- dbGetQuery(con, "DESCRIBE vuefast")
+  available_cols <- table_info$column_name
+  
+  if (!col_map$aircraft_lat %in% available_cols || !col_map$aircraft_lon %in% available_cols) {
+    cli_alert_warning("Aircraft position columns not found in data")
+    return(NULL)
+  }
+  
+  # Build WHERE clause based on config
+  where_clauses <- c()
+  
+  if (!is.null(config$mission_ids)) {
+    mission_list <- paste0("'", config$mission_ids, "'", collapse = ", ")
+    where_clauses <- c(where_clauses, glue("mission_id IN ({mission_list})"))
+  }
+  
+  if (!is.null(config$date_start)) {
+    where_clauses <- c(where_clauses, glue("{col_map$timestamp} >= '{config$date_start}'"))
+  }
+  
+  if (!is.null(config$date_end)) {
+    where_clauses <- c(where_clauses, glue("{col_map$timestamp} <= '{config$date_end}'"))
+  }
+  
+  where_sql <- if (length(where_clauses) > 0) {
+    paste("WHERE", paste(where_clauses, collapse = " AND "))
+  } else {
+    ""
+  }
+  
+  query <- glue("
+    SELECT 
+      {col_map$aircraft_lat} as lat,
+      {col_map$aircraft_lon} as lon
+    FROM vuefast
+    {where_sql}
+  ")
+  
+  cli_alert_info("Querying aircraft positions...")
   data <- dbGetQuery(con, query)
   cli_alert_success("Retrieved {format(nrow(data), big.mark=',')} points")
   
@@ -1077,6 +1137,50 @@ generate_output_filename <- function(config) {
 # MAIN EXECUTION
 # ------------------------------------------------------------------------------
 
+process_coordinates <- function(coord_data, clipmark_data, config, projection, 
+                                 title_prefix, subtitle_suffix) {
+  #' Process coordinates and generate heatmap
+  #' Internal helper function used by run_analysis
+  
+  # Validate coordinates
+  cli_alert("Validating {subtitle_suffix} coordinates...")
+  
+  valid_rows <- is.finite(coord_data$lat) & is.finite(coord_data$lon) &
+                coord_data$lat >= -90 & coord_data$lat <= 90 &
+                coord_data$lon >= -180 & coord_data$lon <= 180
+  
+  n_invalid <- sum(!valid_rows)
+  if (n_invalid > 0) {
+    cli_alert_warning("Removed {format(n_invalid, big.mark=',')} rows with invalid coordinates")
+    coord_data <- coord_data[valid_rows, ]
+  }
+  
+  if (nrow(coord_data) == 0) {
+    cli_alert_danger("No valid coordinates remaining")
+    return(NULL)
+  }
+  
+  # Bin dwell times
+  hex_data <- bin_dwell_times_fast(coord_data, config)
+  
+  # Flag hexes containing clipmarks
+  hex_data <- flag_clipmark_hexes_fast(hex_data, clipmark_data, config)
+  
+  # Create plot
+  plot_title <- paste0(title_prefix, " - ", subtitle_suffix)
+  
+  p <- create_heatmap(
+    hex_data, 
+    projection,
+    config,
+    config$country_filter,
+    config$extent_buffer_km,
+    title = plot_title
+  )
+  
+  return(list(plot = p, hex_data = hex_data))
+}
+
 run_analysis <- function(config, col_map) {
   cli_h1("Hex Bin Dwell Time Analysis")
   
@@ -1084,42 +1188,37 @@ run_analysis <- function(config, col_map) {
   con <- init_database(config, col_map)
   if (is.null(con)) return(NULL)
   
-  # Query data
+  # Query frame center data
+  cli_h2("Loading Frame Center Data")
   frame_data <- query_frame_centers(con, config, col_map)
   
   if (nrow(frame_data) == 0) {
-    cli_alert_danger("No data found for query parameters")
+    cli_alert_danger("No frame center data found for query parameters")
     dbDisconnect(con)
     return(NULL)
   }
+  
+  # Query aircraft position data
+  cli_h2("Loading Aircraft Position Data")
+  aircraft_data <- query_aircraft_positions(con, config, col_map)
   
   # Query clipmarks
   clipmark_data <- query_clipmarks(con, config, col_map)
   
-  # Validate coordinates
-  cli_alert("Validating coordinates...")
-  
-  # Extra validation - remove any rows with NA, NaN, or Inf
-  valid_rows <- is.finite(frame_data$lat) & is.finite(frame_data$lon) &
-                frame_data$lat >= -90 & frame_data$lat <= 90 &
-                frame_data$lon >= -180 & frame_data$lon <= 180
-  
-  n_invalid <- sum(!valid_rows)
-  if (n_invalid > 0) {
-    cli_alert_warning("Removed {format(n_invalid, big.mark=',')} rows with invalid coordinates")
-    frame_data <- frame_data[valid_rows, ]
+  # Validate clipmark data
+  if (!is.null(clipmark_data) && nrow(clipmark_data) > 0) {
+    valid_clips <- is.finite(clipmark_data$lat) & is.finite(clipmark_data$lon) &
+                   clipmark_data$lat >= -90 & clipmark_data$lat <= 90 &
+                   clipmark_data$lon >= -180 & clipmark_data$lon <= 180
+    clipmark_data <- clipmark_data[valid_clips, ]
+    if (nrow(clipmark_data) == 0) clipmark_data <- NULL
   }
   
-  if (nrow(frame_data) == 0) {
-    cli_alert_danger("No valid coordinates remaining after filtering")
-    dbDisconnect(con)
-    return(NULL)
-  }
-  
-  # Choose projection (use trimmed data extent to avoid outliers affecting projection choice)
-  # Use 1st/99th percentile instead of min/max
-  lat_q <- quantile(frame_data$lat, probs = c(0.01, 0.99), na.rm = TRUE)
-  lon_q <- quantile(frame_data$lon, probs = c(0.01, 0.99), na.rm = TRUE)
+  # Choose projection based on frame center data (primary dataset)
+  # Use 1st/99th percentile to avoid outliers
+  valid_frame <- frame_data[is.finite(frame_data$lat) & is.finite(frame_data$lon), ]
+  lat_q <- quantile(valid_frame$lat, probs = c(0.01, 0.99), na.rm = TRUE)
+  lon_q <- quantile(valid_frame$lon, probs = c(0.01, 0.99), na.rm = TRUE)
   
   data_bbox <- c(
     xmin = as.numeric(lon_q[1]),
@@ -1131,23 +1230,8 @@ run_analysis <- function(config, col_map) {
   attr(data_bbox, "crs") <- st_crs(4326)
   projection <- choose_projection_from_bbox(data_bbox, config$country_filter, config$projection_override)
   
-  # Bin dwell times using fast grid method
-  hex_data <- bin_dwell_times_fast(frame_data, config)
-  
-  # Validate clipmark data before flagging
-  if (!is.null(clipmark_data) && nrow(clipmark_data) > 0) {
-    valid_clips <- is.finite(clipmark_data$lat) & is.finite(clipmark_data$lon) &
-                   clipmark_data$lat >= -90 & clipmark_data$lat <= 90 &
-                   clipmark_data$lon >= -180 & clipmark_data$lon <= 180
-    clipmark_data <- clipmark_data[valid_clips, ]
-    if (nrow(clipmark_data) == 0) clipmark_data <- NULL
-  }
-  
-  # Flag hexes containing clipmarks
-  hex_data <- flag_clipmark_hexes_fast(hex_data, clipmark_data, config)
-  
-  # Create plot
-  plot_title <- if (!is.null(config$mission_ids)) {
+  # Create title prefix
+  title_prefix <- if (!is.null(config$mission_ids)) {
     paste("Missions:", paste(config$mission_ids, collapse = ", "))
   } else if (!is.null(config$date_start) || !is.null(config$date_end)) {
     paste("Period:", config$date_start, "to", config$date_end)
@@ -1155,34 +1239,77 @@ run_analysis <- function(config, col_map) {
     "All Missions"
   }
   
-  p <- create_heatmap(
-    hex_data, 
-    projection,
-    config,
-    config$country_filter,
-    config$extent_buffer_km,
-    title = plot_title
+  # Generate base filename
+  base_filename <- generate_output_filename(config)
+  base_name <- tools::file_path_sans_ext(base_filename)
+  file_ext <- tools::file_ext(base_filename)
+  
+  # Results storage
+  results <- list(
+    plots = list(),
+    output_files = list()
   )
   
-  # Generate output filename
-  output_file <- generate_output_filename(config)
-  
-  # Save output
-  cli_alert("Saving to {output_file}...")
-  ggsave(
-    output_file, 
-    plot = p, 
-    width = config$output_width, 
-    height = config$output_height, 
-    dpi = config$output_dpi
+  # Process Frame Center data
+  cli_h2("Processing Frame Center Heatmap")
+  frame_result <- process_coordinates(
+    frame_data, clipmark_data, config, projection,
+    title_prefix, "Camera Frame Center"
   )
-  cli_alert_success("Saved: {output_file}")
+  
+  if (!is.null(frame_result)) {
+    frame_file <- paste0(base_name, "_framecenter.", file_ext)
+    cli_alert("Saving to {frame_file}...")
+    ggsave(
+      frame_file, 
+      plot = frame_result$plot, 
+      width = config$output_width, 
+      height = config$output_height, 
+      dpi = config$output_dpi
+    )
+    cli_alert_success("Saved: {frame_file}")
+    results$plots$frame_center <- frame_result$plot
+    results$output_files$frame_center <- frame_file
+  }
+  
+  # Process Aircraft Position data (if available)
+  if (!is.null(aircraft_data) && nrow(aircraft_data) > 0) {
+    cli_h2("Processing Aircraft Position Heatmap")
+    aircraft_result <- process_coordinates(
+      aircraft_data, clipmark_data, config, projection,
+      title_prefix, "Aircraft Position"
+    )
+    
+    if (!is.null(aircraft_result)) {
+      aircraft_file <- paste0(base_name, "_aircraft.", file_ext)
+      cli_alert("Saving to {aircraft_file}...")
+      ggsave(
+        aircraft_file, 
+        plot = aircraft_result$plot, 
+        width = config$output_width, 
+        height = config$output_height, 
+        dpi = config$output_dpi
+      )
+      cli_alert_success("Saved: {aircraft_file}")
+      results$plots$aircraft <- aircraft_result$plot
+      results$output_files$aircraft <- aircraft_file
+    }
+  } else {
+    cli_alert_warning("Aircraft position data not available - skipping aircraft heatmap")
+  }
   
   # Cleanup
   dbDisconnect(con)
   
-  # Return plot and filename for interactive use
-  return(list(plot = p, output_file = output_file))
+  # Summary
+  cli_h2("Analysis Complete")
+  cli_alert_success("Generated {length(results$output_files)} heatmaps:")
+  for (name in names(results$output_files)) {
+    cli_alert_info("  {name}: {results$output_files[[name]]}")
+  }
+  
+  # Return results
+  return(results)
 }
 
 # ==============================================================================
@@ -1193,10 +1320,11 @@ run_analysis <- function(config, col_map) {
 # generate_synthetic_data(output_dir = config$data_dir, n_missions = 5)
 
 # Run the analysis:
-# p <- run_analysis(config, col_map)
+result <- run_analysis(config, col_map)
 
 # To display interactively:
-# print(p)
+# print(result$plots$frame_center)
+# print(result$plots$aircraft)
 
 cat("\n")
 cli_alert_info("Script loaded. To run:")
@@ -1209,15 +1337,14 @@ cat("
 3. Run analysis:
    result <- run_analysis(config, col_map)
 
-4. Display plot:
-   print(result$plot)
+4. Display plots:
+   print(result$plots$frame_center)   # Camera frame center heatmap
+   print(result$plots$aircraft)        # Aircraft position heatmap
 
-5. Check output file:
-   result$output_file
+5. Check output files:
+   result$output_files
 
-Output filename format:
-  - Mission query:    M2024001_M2024002_20251106_210905.png
-  - Date range query: 20251106_210905_90days.png
-  - All data:         all_missions_20251106_210905.png
-  - With country:     ..._AZE.png (appended)
+Output generates TWO maps per run:
+  - *_framecenter.png  - Where the camera was looking
+  - *_aircraft.png     - Where the aircraft was flying
 ")
