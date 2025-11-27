@@ -24,17 +24,19 @@ This script analyzes 15 Hz camera metadata logs to create heatmaps showing:
 - **Aircraft position dwell time**: Where the aircraft was flying and for how long
 - **Crew interest**: Areas where the crew marked points of interest (highlighted with cyan borders)
 
-Each run generates **two maps**: one for camera frame centers and one for aircraft position, allowing you to compare where the aircraft flew versus where the camera was pointed.
+Each run generates **two maps** by default: one for camera frame centers and one for aircraft position, allowing you to compare where the aircraft flew versus where the camera was pointed. The aircraft map can be disabled via `config$generate_aircraft_map <- FALSE`.
 
 ### Key Features
 
-- **Dual heatmaps**: Generates both frame center and aircraft position maps per run
+- **Dual heatmaps**: Generates both frame center and aircraft position maps (aircraft map toggleable)
 - **Fast processing**: Uses H3 hexagonal indexing (~20 seconds for 35M points)
 - **Flexible queries**: Filter by mission ID(s) or date range
 - **Smart projections**: Auto-selects appropriate map projection based on data extent
+- **Flexible extent control**: Six extent modes including data-based, clipmark-based, country, or manual
+- **Overseas territory handling**: Automatically filters to polygon parts containing data (e.g., France without French Guiana)
 - **Aspect ratio filling**: Map automatically expands to fill output dimensions (default 16:9)
-- **Outlier handling**: Uses trimmed extent (1st-99th percentile) to prevent transit legs from stretching the map
-- **Configurable styling**: Colors, hex size, time buckets all adjustable
+- **Global map support**: Handles dateline-spanning countries and large extents cleanly
+- **Configurable styling**: Colors, hex transparency, borders, time buckets all adjustable
 - **DuckDB backend**: Efficient handling of large CSV datasets (20-30GB+)
 
 ### Frame Center vs Aircraft Position
@@ -54,8 +56,10 @@ The two maps often look quite different because the camera is typically pointed 
 # 1. Load the script
 source("hexbin_dwell_analysis.R")
 
-# 2. Generate test data (if you don't have real data yet)
-generate_synthetic_data(n_missions = 5)
+# 2. Generate test data (choose one):
+generate_synthetic_data(n_missions = 5)           # Random routes
+# OR
+generate_from_kml(kml_dir = "example_routes")     # From KML files
 
 # 3. Run analysis (generates TWO maps)
 result <- run_analysis(config, col_map)
@@ -68,6 +72,65 @@ print(result$plots$aircraft)       # Where the aircraft was flying
 result$output_files
 # $frame_center: "output/all_missions_..._framecenter.png"
 # $aircraft:     "output/all_missions_..._aircraft.png"
+```
+
+---
+
+## Test Data Generation
+
+### Option A: Random Missions (Quick Testing)
+
+```r
+generate_synthetic_data(output_dir = "data/missions", n_missions = 5)
+```
+
+Generates random flight paths with orbits and transits near a base location.
+
+### Option B: KML Route Files (Controlled Testing)
+
+For testing specific geographic scenarios (projection edge cases, dateline crossings, etc.), you can draw routes in Google Earth and use them to generate test data:
+
+```r
+# 1. Create .kml files with LineString paths
+#    - Open Google Earth Pro
+#    - Draw paths using Add > Path
+#    - Save each path as a .kml file (not .kmz)
+
+# 2. Place KML files in a folder
+#    Default: data/routes/
+
+# 3. Generate missions from routes
+generate_from_kml(
+  kml_dir = "data/routes",      # Folder with .kml files
+  output_dir = "data/missions",  # Output folder
+  flight_speed_kts = 300         # Simulated flight speed
+)
+```
+
+Each `.kml` file becomes one mission. The generator:
+- Parses LineString coordinates from the KML
+- Interpolates waypoints to 15 Hz sample rate
+- Generates camera frame centers (mixed nadir/side-looking)
+- Creates synthetic clipmarks at waypoints
+
+### Example KML Routes Included
+
+The `example_routes/` folder contains test routes for common edge cases:
+
+| File | Scenario | Tests |
+|------|----------|-------|
+| `01_central_asia.kml` | Mid-latitude baseline | Normal operation |
+| `02_arctic_high_lat.kml` | Arctic (60-75°N) | High-latitude projection |
+| `03_dateline_crossing.kml` | Pacific dateline | Coordinate wrapping |
+| `04_long_transit_med_arctic.kml` | Mediterranean to Arctic | Large latitude span (50°+) |
+| `05_equatorial_wide.kml` | Equatorial, wide longitude | Wide aspect ratio |
+| `06_southern_hemisphere.kml` | South America | Negative latitudes |
+
+To use them:
+```r
+generate_from_kml(kml_dir = "example_routes", output_dir = "data/missions")
+config$use_existing_db <- FALSE  # Force reimport
+result <- run_analysis(config, col_map)
 ```
 
 ---
@@ -183,9 +246,19 @@ config$dwell_colors <- c("#285DAB", "#5EA5DA", "#F1DCAA", "#F9A63F", "#CD5821")
 config$water_color <- "#1a3a5c"   # Ocean background
 config$land_color <- "#343434"    # Land fill
 
-# Clipmark highlighting
+# Clipmark highlighting (hexes with crew-marked targets)
 config$clipmark_border_color <- "cyan"
 config$clipmark_border_width <- 0.8
+config$clipmark_border_alpha <- 1.0    # Transparency (0-1)
+```
+
+### Hex Bin Styling
+
+```r
+config$hex_alpha <- 0.85           # Fill transparency (0-1)
+config$hex_border_color <- "white" # Outline color
+config$hex_border_width <- 0.1     # Outline width  
+config$hex_border_alpha <- 0.3     # Outline transparency (0-1)
 ```
 
 ### Output Dimensions
@@ -198,14 +271,45 @@ config$output_dpi <- 300     # Resolution
 
 **The map automatically expands to fill the aspect ratio.** If your data covers a tall region but you want 16:9 output, the map will show more area to the east/west to fill the frame.
 
-### Geographic Focus
+### Map Generation
 
 ```r
-# Focus on a specific country (use ISO3 codes)
-config$country_filter <- "AZE"   # Azerbaijan
-config$country_filter <- "TUR"   # Turkey
-config$country_filter <- NULL    # Auto (based on data extent)
+config$generate_aircraft_map <- TRUE   # Generate both frame center + aircraft maps
+config$generate_aircraft_map <- FALSE  # Generate only frame center map
 ```
+
+### Geographic Extent
+
+Control how the map bounds are determined with `extent_mode`:
+
+```r
+config$extent_mode <- "data_countries"     # Default: countries containing frame data
+config$extent_mode <- "data_bbox"          # Raw bounding box of frame data
+config$extent_mode <- "clipmark_countries" # Countries containing clipmarks
+config$extent_mode <- "clipmark_bbox"      # Raw bounding box of clipmarks
+config$extent_mode <- "country"            # Specific country (requires country_filter)
+config$extent_mode <- "manual"             # Manual center + extent
+```
+
+**For `extent_mode = "country"`:**
+```r
+config$extent_mode <- "country"
+config$country_filter <- "IRN"   # Iran (ISO3 code)
+```
+
+**For `extent_mode = "manual"`:**
+```r
+config$extent_mode <- "manual"
+config$manual_center <- c(55, 80)     # c(lat, lon) - center of map
+config$manual_extent_deg <- 60        # Width in degrees
+```
+
+**Buffer (all modes):**
+```r
+config$extent_buffer_km <- 50    # Buffer around extent
+```
+
+For countries that span the dateline (Russia, USA, Canada, etc.), the script uses sensible "continental" bounds automatically.
 
 Find ISO3 codes: https://en.wikipedia.org/wiki/ISO_3166-1_alpha-3
 
@@ -214,18 +318,16 @@ Find ISO3 codes: https://en.wikipedia.org/wiki/ISO_3166-1_alpha-3
 ```r
 config$projection_override <- NULL      # Auto-select (recommended)
 config$projection_override <- "laea"    # Lambert Azimuthal Equal Area
-config$projection_override <- "winkel3" # Winkel Tripel
-config$projection_override <- "mercator"
-config$projection_override <- "robinson"
-config$projection_override <- "albers"
+config$projection_override <- "albers"  # Albers Equal Area Conic
+config$projection_override <- "eqc"     # Equirectangular (Plate Carrée)
+config$projection_override <- "robinson"# Robinson (world maps)
+config$projection_override <- "mercator"# Mercator
 ```
 
-**Auto-selection logic:**
-- Data touching high latitudes (>65°) or spanning >50° latitude → LAEA
-- Small regional (<30° span) → LAEA
-- Medium regional (30-60°) → Albers Equal Area Conic
-- Continental (60-120°) → Winkel Tripel
-- Global (>120°) → Robinson
+Auto-selection logic:
+- Small extent (<30°): LAEA
+- Medium extent (30-60°): Albers or LAEA
+- Large extent (>60° or >80° longitude): Equirectangular
 
 ---
 
@@ -311,6 +413,21 @@ result <- run_analysis(config, col_map)
 ```r
 config$country_filter <- "IRN"  # Iran
 config$extent_buffer_km <- 100   # Add buffer around country
+result <- run_analysis(config, col_map)
+```
+
+### Manual Map Extent (Full Control)
+
+```r
+# Center on Central Asia with 80° span
+config$manual_center <- c(45, 65)    # 45°N, 65°E
+config$manual_extent_deg <- 80       # 80° wide (height auto from 16:9)
+config$country_filter <- NULL        # Clear country filter
+result <- run_analysis(config, col_map)
+
+# Zoom in on a specific region
+config$manual_center <- c(35, 50)    # 35°N, 50°E (Persian Gulf area)
+config$manual_extent_deg <- 20       # Tighter zoom
 result <- run_analysis(config, col_map)
 ```
 
@@ -455,15 +572,29 @@ config$output_format <- "jpg"   # Smaller file size
 
 ### Map looks distorted or has cut-off edges
 
+- Try `config$manual_center` and `config$manual_extent_deg` for full control
 - The projection auto-selection should handle most cases
+- For large extents spanning multiple continents, Equirectangular is used
 - For high-latitude data, LAEA is automatically selected
 - Try `config$projection_override <- "laea"` for problematic regions
 
+### Countries like Russia cause artifacts
+
+- For global views, problematic countries are automatically cropped to the visible extent
+- Use `config$extent_mode <- "country"` with `config$country_filter <- "RUS"` to focus on Russia specifically
+- Or use `config$extent_mode <- "manual"` with `config$manual_center` and `config$manual_extent_deg` for precise control
+
+### Map zooms out to show distant territories (e.g., French Guiana when data is in France)
+
+- The script automatically breaks country multipolygons into parts and only uses parts containing data
+- This should be handled automatically in `data_countries` and `clipmark_countries` modes
+- If still problematic, use `extent_mode = "data_bbox"` or `extent_mode = "manual"`
+
 ### Transit legs stretch the map too much
 
-- The script uses 1st-99th percentile of coordinates by default
-- This excludes outlier points (like long transit legs) from the extent calculation
-- The data is still plotted, just the map extent is based on the core coverage area
+- Use `extent_mode = "clipmark_countries"` or `"clipmark_bbox"` to base extent on targets instead of all data
+- Or use `extent_mode = "manual"` with specific center/extent values
+- The data is still plotted, just the map extent is based on your chosen reference
 
 ### Colors don't match categories
 
@@ -506,13 +637,37 @@ CSV Files → DuckDB Import → Query by Mission/Date →
 
 ### Extent Calculation
 
-The map extent is calculated in three steps:
+The map extent is determined by `extent_mode`:
 
-1. **Trimmed extent**: Uses 1st-99th percentile of hex centroids to exclude outliers
-2. **Buffer**: Adds `extent_buffer_km` plus 15% context buffer
-3. **Aspect ratio expansion**: Expands in X or Y direction to match output dimensions
+1. **manual**: Uses `manual_center` and `manual_extent_deg`
+2. **country**: Uses `country_filter` ISO3 code (special handling for dateline-spanning countries)
+3. **data_countries** (default): Countries containing frame center data
+4. **data_bbox**: Raw bounding box of frame center data
+5. **clipmark_countries**: Countries containing clipmark locations
+6. **clipmark_bbox**: Raw bounding box of clipmarks
 
-This ensures transit legs don't stretch the map while still showing geographic context.
+After extent is determined:
+- Buffer added (`extent_buffer_km`)
+- Clamped to valid lat/lon ranges
+- Expanded to match output aspect ratio (16:9 default)
+
+**Overseas Territory Handling**
+
+Countries with distant territories (France → French Guiana, UK → Falklands, Netherlands → Caribbean, etc.) are handled by breaking multipolygons into individual parts and only using the parts that actually contain data. This prevents the map from zooming out to show French Guiana when your data is only in metropolitan France.
+
+**Special Country Handling**
+
+Countries that span the dateline or have extreme extents use predefined "continental" bounds:
+
+| Country | Extent Used |
+|---------|-------------|
+| Russia (RUS) | 20°E to 180°E, 41°N to 82°N |
+| USA | 125°W to 66°W, 24°N to 50°N (CONUS) |
+| Canada (CAN) | 141°W to 52°W, 42°N to 72°N |
+| New Zealand (NZL) | 166°E to 179°E |
+| Fiji (FJI) | 177°E to 180°E |
+
+For global views, these countries are cropped to the visible extent to prevent rendering artifacts.
 
 ### Performance
 
@@ -551,4 +706,4 @@ For issues or questions:
 
 ---
 
-*Generated with Claude AI assistance - Version 1.2*
+*Generated with Claude AI assistance - Version 1.4*

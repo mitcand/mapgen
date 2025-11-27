@@ -49,7 +49,7 @@ config <- list(
  # === DATA SOURCE ===
   data_dir = "data/missions",           # Folder containing CSV files
   db_path = "missions.duckdb",          # DuckDB database path (created automatically)
-  use_existing_db = TRUE,              # TRUE = reuse existing DB, FALSE = reimport CSVs
+  use_existing_db = FALSE,              # TRUE = reuse existing DB, FALSE = reimport CSVs
   
   # === QUERY FILTERS ===
   # Use ONE of these approaches to filter data:
@@ -58,6 +58,34 @@ config <- list(
   # Option B: Date range
   date_start = NULL,                    # e.g., "2024-01-01" or NULL
   date_end = NULL,                      # e.g., "2024-03-31" or NULL
+  
+  # === MAP GENERATION ===
+  generate_aircraft_map = TRUE,         # TRUE = generate both maps, FALSE = frame center only
+  
+  # === GEOGRAPHIC EXTENT ===
+  # extent_mode: How to determine map bounds
+  #   "data_countries"     - Countries containing frame center data (default)
+  #   "data_bbox"          - Raw bounding box of frame center data
+  #   "clipmark_countries" - Countries containing clipmark locations
+  #   "clipmark_bbox"      - Raw bounding box of clipmark locations
+  #   "country"            - Specific country (set country_filter below)
+  #   "manual"             - Manual center point + extent (set manual_center, manual_extent_deg)
+  extent_mode = "data_countries",
+  
+  # For extent_mode = "country":
+  #   ISO3 codes: "AZE" (Azerbaijan), "TUR" (Turkey), "USA", "GBR", etc.
+  #   Find codes at: https://en.wikipedia.org/wiki/ISO_3166-1_alpha-3
+  country_filter = NULL,
+  
+
+  # For extent_mode = "manual":
+  #   manual_center = c(lat, lon)  - Center of the map
+  #   manual_extent_deg = 50       - Width in degrees (height auto from aspect ratio)
+  manual_center = NULL,
+  manual_extent_deg = NULL,
+  
+  # Buffer around extent (applies to all modes)
+  extent_buffer_km = 50,
   
   # === HEX GRID ===
   hex_diameter_km = 25,                 # Target hex diameter in km (H3 picks closest size)
@@ -85,18 +113,18 @@ config <- list(
   # Clipmark highlighting (hexes containing crew-marked POIs)
   clipmark_border_color = "cyan",       # Border color for highlighted hexes
   clipmark_border_width = 0.8,          # Border width for highlighted hexes
+  clipmark_border_alpha = 1.0,          # Border transparency (0-1)
   
-  # === GEOGRAPHIC EXTENT ===
-  # country_filter: Set to ISO3 code to focus on a specific country
-  #   Examples: "AZE" (Azerbaijan), "TUR" (Turkey), "USA", "GBR", NULL (auto)
-  #   Find codes at: https://en.wikipedia.org/wiki/ISO_3166-1_alpha-3
-  country_filter = NULL,
-  extent_buffer_km = 50,                # Buffer around data/country extent
+  # Hex bin styling
+  hex_alpha = 0.85,                     # Transparency of hex fills (0-1)
+  hex_border_color = "white",           # Border color for hex outlines
+  hex_border_width = 0.1,               # Border width for hex outlines
+  hex_border_alpha = 0.3,               # Transparency of hex borders (0-1)
   
   # === PROJECTION ===
   # projection_override: Force a specific projection, or NULL for auto-select
-  #   Options: "laea" (Lambert Azimuthal), "winkel3", "mercator", 
-  #            "robinson", "albers", NULL (auto based on extent)
+  #   Options: "laea" (Lambert Azimuthal), "albers", "robinson", "eqc" (Equirectangular),
+  #            "winkel3", "mercator", NULL (auto based on extent)
   projection_override = NULL,
   
   # === OUTPUT ===
@@ -174,6 +202,314 @@ if (!requireNamespace("rnaturalearthhires", quietly = TRUE)) {
 # ------------------------------------------------------------------------------
 # SYNTHETIC DATA GENERATOR (for development without real data)
 # ------------------------------------------------------------------------------
+
+# KML ROUTE-BASED GENERATOR
+# Place .kml files with LineString elements in a folder, and this will generate
+# synthetic mission data that follows those routes.
+
+parse_kml_route <- function(kml_file) {
+  #' Parse a KML file and extract LineString coordinates
+
+  #' 
+
+  #' @param kml_file Path to KML file
+
+  #' @return Data frame with lon, lat columns (in that order, as KML stores them)
+  
+
+  if (!file.exists(kml_file)) {
+    cli_alert_danger("KML file not found: {kml_file}")
+    return(NULL)
+  }
+  
+  # Read KML as text
+  kml_text <- paste(readLines(kml_file, warn = FALSE), collapse = "\n")
+  
+  # Extract coordinates from LineString elements
+  # KML format: <coordinates>lon,lat,alt lon,lat,alt ...</coordinates>
+  coord_pattern <- "<coordinates>\\s*([^<]+)\\s*</coordinates>"
+  coord_matches <- regmatches(kml_text, gregexpr(coord_pattern, kml_text, perl = TRUE))[[1]]
+  
+  if (length(coord_matches) == 0) {
+    cli_alert_warning("No LineString coordinates found in {basename(kml_file)}")
+    return(NULL)
+  }
+  
+  # Parse all coordinate strings
+  all_coords <- data.frame(lon = numeric(), lat = numeric())
+  
+  for (match in coord_matches) {
+    # Extract just the coordinate text
+    coord_text <- gsub("</?coordinates>", "", match)
+    coord_text <- trimws(coord_text)
+    
+    # Split by whitespace (each point is lon,lat,alt)
+    points <- strsplit(coord_text, "\\s+")[[1]]
+    points <- points[nchar(points) > 0]
+    
+    for (point in points) {
+      parts <- as.numeric(strsplit(point, ",")[[1]])
+      if (length(parts) >= 2 && !any(is.na(parts[1:2]))) {
+        all_coords <- rbind(all_coords, data.frame(lon = parts[1], lat = parts[2]))
+      }
+    }
+  }
+  
+  if (nrow(all_coords) == 0) {
+    cli_alert_warning("Could not parse coordinates from {basename(kml_file)}")
+    return(NULL)
+  }
+  
+  cli_alert_success("Parsed {nrow(all_coords)} waypoints from {basename(kml_file)}")
+  return(all_coords)
+}
+
+interpolate_route <- function(waypoints, target_samples, speed_variation = 0.1) {
+  #' Interpolate waypoints to create smooth flight path at desired sample rate
+  #' 
+  #' @param waypoints Data frame with lon, lat columns
+  #' @param target_samples Approximate number of output samples
+  #' @param speed_variation Random speed variation factor (0-1)
+  #' @return Data frame with interpolated lon, lat
+  
+  n_waypoints <- nrow(waypoints)
+  if (n_waypoints < 2) return(waypoints)
+  
+  # Calculate segment distances (approximate degrees)
+  segment_dists <- sqrt(
+    diff(waypoints$lon)^2 + diff(waypoints$lat)^2
+  )
+  total_dist <- sum(segment_dists)
+  
+  # Allocate samples proportional to segment length
+  samples_per_segment <- pmax(1, round((segment_dists / total_dist) * target_samples))
+  
+  # Interpolate each segment
+  result <- data.frame(lon = numeric(), lat = numeric())
+  
+  for (i in 1:(n_waypoints - 1)) {
+    n <- samples_per_segment[i]
+    t <- seq(0, 1, length.out = n + 1)[1:n]  # Don't include endpoint (next segment starts there)
+    
+    # Add some speed variation (slow down/speed up randomly)
+    if (speed_variation > 0) {
+      t <- t + cumsum(rnorm(n, 0, speed_variation / n))
+      t <- pmax(0, pmin(1, t))  # Clamp to [0,1]
+      t <- sort(t)
+    }
+    
+    seg_lon <- waypoints$lon[i] + t * (waypoints$lon[i+1] - waypoints$lon[i])
+    seg_lat <- waypoints$lat[i] + t * (waypoints$lat[i+1] - waypoints$lat[i])
+    
+    result <- rbind(result, data.frame(lon = seg_lon, lat = seg_lat))
+  }
+  
+  # Add final waypoint
+  result <- rbind(result, waypoints[n_waypoints, ])
+  
+  return(result)
+}
+
+generate_camera_from_aircraft <- function(aircraft_lon, aircraft_lat, 
+                                           look_mode = "mixed",
+                                           offset_range_deg = c(0.1, 0.8)) {
+
+  #' Generate camera frame center positions based on aircraft position
+  #' 
+  #' @param aircraft_lon Vector of aircraft longitudes
+  #' @param aircraft_lat Vector of aircraft latitudes
+  #' @param look_mode One of: "mixed", "side_look", "nadir", "forward"
+  #' @param offset_range_deg Range of offset distance in degrees
+  #' @return Data frame with frame_lon, frame_lat
+  
+  n <- length(aircraft_lon)
+  frame_lon <- numeric(n)
+  frame_lat <- numeric(n)
+  
+  # Calculate heading at each point
+  heading <- numeric(n)
+  for (i in 2:n) {
+    heading[i] <- atan2(
+      aircraft_lon[i] - aircraft_lon[i-1],
+      aircraft_lat[i] - aircraft_lat[i-1]
+    )
+  }
+  heading[1] <- heading[2]
+  
+  # Smooth heading
+  for (i in 2:(n-1)) {
+    heading[i] <- mean(heading[max(1,i-5):min(n,i+5)])
+  }
+  
+  for (i in 1:n) {
+    mode <- if (look_mode == "mixed") {
+      sample(c("side_look", "nadir", "forward"), 1, prob = c(0.6, 0.25, 0.15))
+    } else {
+      look_mode
+    }
+    
+    offset_dist <- runif(1, offset_range_deg[1], offset_range_deg[2])
+    
+    if (mode == "nadir") {
+      # Looking straight down
+      frame_lon[i] <- aircraft_lon[i] + rnorm(1, 0, 0.01)
+      frame_lat[i] <- aircraft_lat[i] + rnorm(1, 0, 0.01)
+      
+    } else if (mode == "side_look") {
+      # Looking perpendicular to track
+      side <- sample(c(-1, 1), 1)
+      offset_angle <- heading[i] + side * pi/2 + rnorm(1, 0, 0.1)
+      frame_lon[i] <- aircraft_lon[i] + offset_dist * sin(offset_angle)
+      frame_lat[i] <- aircraft_lat[i] + offset_dist * cos(offset_angle)
+      
+    } else if (mode == "forward") {
+      # Looking ahead
+      offset_angle <- heading[i] + rnorm(1, 0, 0.2)
+      frame_lon[i] <- aircraft_lon[i] + offset_dist * 0.5 * sin(offset_angle)
+      frame_lat[i] <- aircraft_lat[i] + offset_dist * 0.5 * cos(offset_angle)
+    }
+  }
+  
+  return(data.frame(frame_lon = frame_lon, frame_lat = frame_lat))
+}
+
+generate_from_kml <- function(kml_dir = "data/routes",
+                               output_dir = "data/missions",
+                               sample_rate_hz = 15,
+                               flight_speed_kts = 300,
+                               seed = 42) {
+  #' Generate synthetic mission data from KML route files
+  #' 
+  #' @param kml_dir Directory containing .kml files with LineString routes
+  #' @param output_dir Output directory for generated CSV files
+  #' @param sample_rate_hz Sample rate (default 15 Hz)
+  #' @param flight_speed_kts Approximate flight speed in knots
+  #' @param seed Random seed for reproducibility
+  #' @return List with generated mission info
+  
+  set.seed(seed)
+  
+  # Find KML files
+  kml_files <- list.files(kml_dir, pattern = "\\.kml$", full.names = TRUE, 
+                          ignore.case = TRUE)
+  
+  if (length(kml_files) == 0) {
+    cli_alert_danger("No KML files found in {kml_dir}")
+    cli_alert_info("Create a folder with .kml files containing LineString routes")
+    cli_alert_info("You can create these in Google Earth by drawing paths and saving as KML")
+    return(NULL)
+  }
+  
+  cli_alert_info("Found {length(kml_files)} KML route file(s)")
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  # Speed in degrees per second (approximate at mid-latitudes)
+  # 1 knot ≈ 1.852 km/h, 1 degree ≈ 111 km at equator
+  speed_deg_per_sec <- (flight_speed_kts * 1.852) / (111 * 3600)
+  
+  missions <- list()
+  
+  for (i in seq_along(kml_files)) {
+    kml_file <- kml_files[i]
+    mission_id <- sprintf("M2024%03d", i)
+    route_name <- tools::file_path_sans_ext(basename(kml_file))
+    
+    cli_h2("Processing: {route_name}")
+    
+    # Parse route
+    waypoints <- parse_kml_route(kml_file)
+    if (is.null(waypoints)) next
+    
+    # Calculate route length and duration
+    total_dist_deg <- sum(sqrt(diff(waypoints$lon)^2 + diff(waypoints$lat)^2))
+    flight_duration_sec <- total_dist_deg / speed_deg_per_sec
+    n_samples <- as.integer(flight_duration_sec * sample_rate_hz)
+    
+    cli_alert_info("Route length: ~{round(total_dist_deg * 111)} km")
+    cli_alert_info("Flight duration: ~{round(flight_duration_sec / 3600, 1)} hours")
+    cli_alert_info("Generating {format(n_samples, big.mark=',')} samples at {sample_rate_hz} Hz")
+    
+    # Interpolate route to sample rate
+    path <- interpolate_route(waypoints, n_samples, speed_variation = 0.05)
+    n_samples <- nrow(path)  # May differ slightly
+    
+    # Generate timestamps
+    timestamps <- seq(
+      from = as.POSIXct(paste0("2024-", sprintf("%02d", (i %% 12) + 1), "-15 06:00:00"), tz = "UTC"),
+      by = 1/sample_rate_hz,
+      length.out = n_samples
+    )
+    
+    # Generate camera positions
+    camera <- generate_camera_from_aircraft(path$lon, path$lat, look_mode = "mixed")
+    
+    # Create vuefast dataframe
+    vuefast <- data.frame(
+      timestamp = timestamps,
+      frame_center_lat = camera$frame_lat,
+      frame_center_lon = camera$frame_lon,
+      aircraft_lat = path$lat,
+      aircraft_lon = path$lon,
+      altitude_ft = 60000 + rnorm(n_samples, 0, 500),
+      camera_azimuth = runif(n_samples, 0, 360),
+      camera_elevation = runif(n_samples, -90, 0)
+    )
+    
+    # Create vueslow (1 Hz subset)
+    vueslow_idx <- seq(1, n_samples, by = sample_rate_hz)
+    vueslow <- data.frame(
+      timestamp = timestamps[vueslow_idx],
+      aircraft_lat = path$lat[vueslow_idx],
+      aircraft_lon = path$lon[vueslow_idx],
+      outside_air_temp_c = -56 + rnorm(length(vueslow_idx), 0, 2),
+      sensor_temp_c = 20 + rnorm(length(vueslow_idx), 0, 1)
+    )
+    
+    # Create clipmarks at interesting points along route
+    n_clips <- min(15, max(3, nrow(waypoints)))
+    clip_indices <- round(seq(1, n_samples, length.out = n_clips + 2)[2:(n_clips + 1)])
+    
+    clipmarks <- data.frame(
+      start_time = timestamps[clip_indices],
+      end_time = timestamps[pmin(clip_indices + sample_rate_hz * 60, n_samples)],
+      poi_lat = camera$frame_lat[clip_indices],
+      poi_lon = camera$frame_lon[clip_indices],
+      description = paste("Waypoint", 1:n_clips)
+    )
+    
+    # Save files
+    vuefast_file <- file.path(output_dir, paste0(mission_id, "_vuefast.csv"))
+    vueslow_file <- file.path(output_dir, paste0(mission_id, "_vueslow.csv"))
+    clips_file <- file.path(output_dir, paste0(mission_id, "_clipmarks.csv"))
+    
+    write.csv(vuefast, vuefast_file, row.names = FALSE)
+    write.csv(vueslow, vueslow_file, row.names = FALSE)
+    write.csv(clipmarks, clips_file, row.names = FALSE)
+    
+    cli_alert_success("Generated: {mission_id} from {route_name}")
+    cli_alert_info("  {format(n_samples, big.mark=',')} vuefast records")
+    cli_alert_info("  {length(vueslow_idx)} vueslow records")
+    cli_alert_info("  {nrow(clipmarks)} clipmarks")
+    
+    missions[[mission_id]] <- list(
+      route_name = route_name,
+      kml_file = kml_file,
+      n_samples = n_samples,
+      duration_hours = flight_duration_sec / 3600,
+      extent = list(
+        lat_range = range(path$lat),
+        lon_range = range(path$lon)
+      )
+    )
+  }
+  
+  cli_h2("KML Route Generation Complete")
+  cli_alert_success("Generated {length(missions)} missions in {output_dir}")
+  
+  return(missions)
+}
+
+# RANDOM MISSION GENERATOR (original)
 
 generate_synthetic_data <- function(output_dir = "data/missions",
                                     n_missions = 5,
@@ -631,13 +967,13 @@ query_aircraft_positions <- function(con, config, col_map) {
 #   - Global (>120°): Robinson or Mercator
 # ------------------------------------------------------------------------------
 
-choose_projection <- function(points_sf, country_filter = NULL, projection_override = NULL) {
+choose_projection <- function(points_sf, config) {
   # Wrapper for sf objects - extracts bbox and calls main function
   bbox <- st_bbox(points_sf)
-  return(choose_projection_from_bbox(bbox, country_filter, projection_override))
+  return(choose_projection_from_bbox(bbox, config))
 }
 
-choose_projection_from_bbox <- function(bbox, country_filter = NULL, projection_override = NULL) {
+choose_projection_from_bbox <- function(bbox, config) {
   
   # Extract bbox values as plain numbers
   xmin <- as.numeric(bbox["xmin"])
@@ -648,38 +984,67 @@ choose_projection_from_bbox <- function(bbox, country_filter = NULL, projection_
   center_lon <- (xmin + xmax) / 2
   center_lat <- (ymin + ymax) / 2
   
-  if (!is.null(projection_override)) {
-    proj_string <- switch(projection_override,
+  if (!is.null(config$projection_override)) {
+    proj_string <- switch(config$projection_override,
       "laea" = glue("+proj=laea +lat_0={center_lat} +lon_0={center_lon} +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"),
       "winkel3" = glue("+proj=wintri +lon_0={center_lon} +datum=WGS84 +units=m +no_defs"),
       "mercator" = "+proj=merc +datum=WGS84 +units=m +no_defs",
       "robinson" = glue("+proj=robin +lon_0={center_lon} +datum=WGS84 +units=m +no_defs"),
       "albers" = glue("+proj=aea +lat_1={center_lat - 10} +lat_2={center_lat + 10} +lat_0={center_lat} +lon_0={center_lon} +datum=WGS84 +units=m +no_defs"),
+      "eqc" = glue("+proj=eqc +lat_0=0 +lon_0={center_lon} +datum=WGS84 +units=m +no_defs"),
       # Default fallback
       glue("+proj=laea +lat_0={center_lat} +lon_0={center_lon} +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs")
     )
-    cli_alert_info("Using override projection: {projection_override}")
+    cli_alert_info("Using override projection: {config$projection_override}")
     return(proj_string)
   }
   
-  # Get extent to analyze - override with country if specified
-  if (!is.null(country_filter)) {
+  # Adjust extent calculation based on extent_mode
+  extent_mode <- config$extent_mode
+  
+  if (extent_mode == "manual" && !is.null(config$manual_center) && !is.null(config$manual_extent_deg)) {
+    center_lat <- config$manual_center[1]
+    center_lon <- config$manual_center[2]
+    xmin <- center_lon - config$manual_extent_deg / 2
+    xmax <- center_lon + config$manual_extent_deg / 2
+    ymin <- center_lat - config$manual_extent_deg / 2
+    ymax <- center_lat + config$manual_extent_deg / 2
+    cli_alert_info("Using manual extent for projection: center ({center_lat}°N, {center_lon}°E)")
+    
+  } else if (extent_mode == "country" && !is.null(config$country_filter)) {
     countries <- ne_countries(scale = 50, returnclass = "sf")
-    country <- countries[countries$iso_a3 == country_filter, ]
+    country <- countries[countries$iso_a3 == config$country_filter, ]
     
     if (nrow(country) > 0) {
-      bbox <- st_bbox(country)
-      xmin <- as.numeric(bbox["xmin"])
-      xmax <- as.numeric(bbox["xmax"])
-      ymin <- as.numeric(bbox["ymin"])
-      ymax <- as.numeric(bbox["ymax"])
+      # Special handling for countries that span the dateline
+      special_extents <- list(
+        RUS = c(20, 41, 180, 82),
+        USA = c(-125, 24, -66, 50),
+        CAN = c(-141, 42, -52, 72),
+        NZL = c(166, -47, 179, -34),
+        FJI = c(177, -21, 180, -12)
+      )
+      
+      if (config$country_filter %in% names(special_extents)) {
+        ext <- special_extents[[config$country_filter]]
+        xmin <- ext[1]
+        ymin <- ext[2]
+        xmax <- ext[3]
+        ymax <- ext[4]
+        cli_alert_info("Using continental extent for projection: {config$country_filter}")
+      } else {
+        bbox <- st_bbox(country)
+        xmin <- as.numeric(bbox["xmin"])
+        xmax <- as.numeric(bbox["xmax"])
+        ymin <- as.numeric(bbox["ymin"])
+        ymax <- as.numeric(bbox["ymax"])
+        cli_alert_info("Using country extent for projection: {config$country_filter}")
+      }
       center_lon <- (xmin + xmax) / 2
       center_lat <- (ymin + ymax) / 2
-      cli_alert_info("Using country extent for projection: {country_filter}")
-    } else {
-      cli_alert_warning("Country code '{country_filter}' not found, using data extent")
     }
   }
+  # For data_countries, data_bbox, clipmark_* modes, use the passed bbox
   
   # Calculate extent characteristics
   lon_span <- xmax - xmin
@@ -696,26 +1061,30 @@ choose_projection_from_bbox <- function(bbox, country_filter = NULL, projection_
   # 
   # Small regional (< 30° span): Lambert Azimuthal Equal Area - best for small areas, equal area
   # Medium regional (30-60° span): Albers Equal Area Conic - good for mid-latitudes, equal area
-  # Large/continental (60-120° span): Winkel Tripel - good balance of distortions
-  # Global/multi-continental (> 120° span): Robinson or Mercator
+  # Large/continental (60-120° span): Robinson - fills rectangular frame
+  # Global/multi-continental (> 120° span): Robinson or Equirectangular
   #
   # Special cases:
-  # - High latitudes (>65° or <-65°): Use LAEA to avoid conic projection issues
-  # - Data extending to polar regions: Use LAEA
-  # - Very large latitude span (>50°): Use LAEA or Winkel Tripel
+  # - High latitudes (>65°) with SMALL extent: Use LAEA
+  # - Large extents always use rectangular projections (Robinson/Equirectangular)
   
   max_span <- max(lon_span, lat_span)
   max_lat <- max(abs(ymin), abs(ymax))
   
-  # Check for high-latitude data that would break conic projections
+  # Check for high-latitude data
   is_polar_adjacent <- max_lat > 65
-  is_large_lat_span <- lat_span > 50
+  is_large_extent <- max_span > 60 || lat_span > 50 || lon_span > 80
   
-  if (is_polar_adjacent || is_large_lat_span) {
-    # Use LAEA for anything touching polar regions or spanning huge latitude ranges
-    # LAEA handles all latitudes gracefully
+  if (is_large_extent) {
+    # Large extents - use Equirectangular (Plate Carrée) for simplicity
+    # This maps lat/lon directly to x/y, avoiding complex distortion issues
+    proj_string <- glue("+proj=eqc +lat_0=0 +lon_0={center_lon} +datum=WGS84 +units=m +no_defs")
+    proj_name <- "Equirectangular (large extent)"
+    
+  } else if (is_polar_adjacent) {
+    # Small extent near poles - LAEA handles this well
     proj_string <- glue("+proj=laea +lat_0={center_lat} +lon_0={center_lon} +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs")
-    proj_name <- "Lambert Azimuthal Equal Area (high latitude/large extent)"
+    proj_name <- "Lambert Azimuthal Equal Area (high latitude)"
     
   } else if (max_span < 30) {
     # Small regional - Lambert Azimuthal Equal Area
@@ -723,11 +1092,11 @@ choose_projection_from_bbox <- function(bbox, country_filter = NULL, projection_
     proj_name <- "Lambert Azimuthal Equal Area (regional)"
     
   } else if (max_span < 60) {
-    # Medium regional
+    # Medium regional - Albers for mid-latitudes
     if (abs(center_lat) > 60) {
-      # High latitude - use stereographic
-      proj_string <- glue("+proj=stere +lat_0={sign(center_lat) * 90} +lon_0={center_lon} +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs")
-      proj_name <- "Polar Stereographic"
+      # High latitude - use LAEA
+      proj_string <- glue("+proj=laea +lat_0={center_lat} +lon_0={center_lon} +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs")
+      proj_name <- "Lambert Azimuthal Equal Area (high latitude regional)"
     } else {
       # Mid-latitudes - Albers Equal Area
       lat1 <- center_lat - lat_span / 4
@@ -736,22 +1105,10 @@ choose_projection_from_bbox <- function(bbox, country_filter = NULL, projection_
       proj_name <- "Albers Equal Area Conic"
     }
     
-  } else if (max_span < 120) {
-    # Large/continental - Winkel Tripel
-    proj_string <- glue("+proj=wintri +lon_0={center_lon} +datum=WGS84 +units=m +no_defs")
-    proj_name <- "Winkel Tripel (continental)"
-    
   } else {
-    # Global/multi-continental
-    if (abs(center_lat) < 30 && lon_span > lat_span) {
-      # Equatorial with wide longitude span - Mercator
-      proj_string <- "+proj=merc +datum=WGS84 +units=m +no_defs"
-      proj_name <- "Mercator (equatorial wide)"
-    } else {
-      # General global - Robinson
-      proj_string <- glue("+proj=robin +lon_0={center_lon} +datum=WGS84 +units=m +no_defs")
-      proj_name <- "Robinson (global)"
-    }
+    # Fallback - Robinson
+    proj_string <- glue("+proj=robin +lon_0={center_lon} +datum=WGS84 +units=m +no_defs")
+    proj_name <- "Robinson (continental)"
   }
   
   cli_alert_info("Auto-selected projection: {proj_name}")
@@ -937,79 +1294,291 @@ flag_clipmark_hexes_fast <- function(hex_data, clipmark_data, config) {
 # PLOTTING
 # ------------------------------------------------------------------------------
 
-create_heatmap <- function(hex_data, projection, config, country_filter = NULL, 
-                           extent_buffer_km = 50, title = NULL) {
+create_heatmap <- function(hex_data, projection, config, clipmarks_sf = NULL, title = NULL) {
   cli_alert("Creating heatmap...")
   
   # Separate hexes with clipmarks for border overlay
   hex_with_clips <- hex_data[hex_data$has_clipmark == TRUE, ]
   n_clipmark_hexes <- nrow(hex_with_clips)
   
-  # Transform hex data to projected CRS
-  hex_proj <- st_transform(hex_data, projection)
-  hex_with_clips_proj <- if (n_clipmark_hexes > 0) st_transform(hex_with_clips, projection) else NULL
-  
-  # Get extent in projected coordinates using trimmed data (1st-99th percentile)
-  hex_coords <- suppressWarnings(st_coordinates(st_centroid(hex_proj)))
-  
-  x_quantiles <- quantile(hex_coords[, "X"], probs = c(0.01, 0.99), na.rm = TRUE)
-  y_quantiles <- quantile(hex_coords[, "Y"], probs = c(0.01, 0.99), na.rm = TRUE)
-  
-  # Start with trimmed extent in projected coordinates
-  xmin <- as.numeric(x_quantiles[1])
-  xmax <- as.numeric(x_quantiles[2])
-  ymin <- as.numeric(y_quantiles[1])
-  ymax <- as.numeric(y_quantiles[2])
-  
-  # Add buffer (in meters since projected)
-  buffer_m <- extent_buffer_km * 1000
-  x_range <- xmax - xmin
-  y_range <- ymax - ymin
-  context_buffer <- max(x_range, y_range) * 0.15
-  total_buffer <- buffer_m + context_buffer
-  
-  xmin <- xmin - total_buffer
-  xmax <- xmax + total_buffer
-  ymin <- ymin - total_buffer
-  ymax <- ymax + total_buffer
-  
-  # Expand extent to match output aspect ratio
-  output_aspect <- config$output_width / config$output_height
-  
-  current_x_range <- xmax - xmin
-  current_y_range <- ymax - ymin
-  current_aspect <- current_x_range / current_y_range
-  
-  if (current_aspect < output_aspect) {
-    # Need to expand x (make wider)
-    target_x_range <- current_y_range * output_aspect
-    expand_x <- (target_x_range - current_x_range) / 2
-    xmin <- xmin - expand_x
-    xmax <- xmax + expand_x
-  } else {
-    # Need to expand y (make taller)
-    target_y_range <- current_x_range / output_aspect
-    expand_y <- (target_y_range - current_y_range) / 2
-    ymin <- ymin - expand_y
-    ymax <- ymax + expand_y
-  }
-  
-  # Get basemap and transform to projected CRS
+  # Load basemap
   cli_alert("Loading basemap...")
   world <- ne_countries(scale = 50, returnclass = "sf")
   
-  # Transform world to projection (will clip to extent during plotting)
-  world_proj <- tryCatch({
-    sf_use_s2_setting <- sf::sf_use_s2()
-    sf::sf_use_s2(FALSE)
-    on.exit(sf::sf_use_s2(sf_use_s2_setting), add = TRUE)
+  # Disable s2 for simpler planar operations
+  sf_use_s2_setting <- sf::sf_use_s2()
+  sf::sf_use_s2(FALSE)
+  on.exit(sf::sf_use_s2(sf_use_s2_setting), add = TRUE)
+  
+  # Determine extent based on extent_mode
+  extent_mode <- config$extent_mode
+  data_extent <- NULL
+  
+  cli_alert_info("Extent mode: {extent_mode}")
+  
+  if (extent_mode == "manual") {
+    # Manual center + extent
+    if (is.null(config$manual_center) || is.null(config$manual_extent_deg)) {
+      cli_alert_warning("Manual mode requires manual_center and manual_extent_deg, falling back to data_countries")
+      extent_mode <- "data_countries"
+    } else {
+      center_lat <- config$manual_center[1]
+      center_lon <- config$manual_center[2]
+      
+      output_aspect <- config$output_width / config$output_height
+      if (output_aspect >= 1) {
+        half_lon <- config$manual_extent_deg / 2
+        half_lat <- (config$manual_extent_deg / output_aspect) / 2
+      } else {
+        half_lat <- config$manual_extent_deg / 2
+        half_lon <- (config$manual_extent_deg * output_aspect) / 2
+      }
+      
+      data_extent <- st_bbox(c(
+        xmin = center_lon - half_lon,
+        ymin = center_lat - half_lat,
+        xmax = center_lon + half_lon,
+        ymax = center_lat + half_lat
+      ), crs = st_crs(4326))
+      cli_alert_info("Manual extent: center ({center_lat}°N, {center_lon}°E), span {config$manual_extent_deg}°")
+    }
+  }
+  
+  if (extent_mode == "country") {
+    # Specific country filter
+    if (is.null(config$country_filter)) {
+      cli_alert_warning("Country mode requires country_filter, falling back to data_countries")
+      extent_mode <- "data_countries"
+    } else {
+      filter_country <- world[world$iso_a3 == config$country_filter, ]
+      if (nrow(filter_country) > 0) {
+        cli_alert_info("Using country: {filter_country$name[1]} ({config$country_filter})")
+        
+        # Special handling for dateline-spanning countries
+        special_extents <- list(
+          RUS = c(20, 41, 180, 82),
+          USA = c(-125, 24, -66, 50),
+          CAN = c(-141, 42, -52, 72),
+          NZL = c(166, -47, 179, -34),
+          FJI = c(177, -21, 180, -12)
+        )
+        
+        if (config$country_filter %in% names(special_extents)) {
+          ext <- special_extents[[config$country_filter]]
+          data_extent <- st_bbox(c(xmin = ext[1], ymin = ext[2], xmax = ext[3], ymax = ext[4]),
+                                  crs = st_crs(4326))
+          cli_alert_info("Using continental extent for {config$country_filter}")
+        } else {
+          data_extent <- st_bbox(filter_country)
+        }
+      } else {
+        cli_alert_warning("Country '{config$country_filter}' not found, falling back to data_countries")
+        extent_mode <- "data_countries"
+      }
+    }
+  }
+  
+  if (extent_mode == "clipmark_bbox") {
+    # Raw clipmark bounding box
+    if (is.null(clipmarks_sf) || nrow(clipmarks_sf) == 0) {
+      cli_alert_warning("No clipmarks available, falling back to data_countries")
+      extent_mode <- "data_countries"
+    } else {
+      data_extent <- st_bbox(clipmarks_sf)
+      cli_alert_info("Using clipmark bbox: {nrow(clipmarks_sf)} clipmarks")
+    }
+  }
+  
+  if (extent_mode == "clipmark_countries") {
+    # Countries containing clipmarks
+    if (is.null(clipmarks_sf) || nrow(clipmarks_sf) == 0) {
+      cli_alert_warning("No clipmarks available, falling back to data_countries")
+      extent_mode <- "data_countries"
+    } else {
+      clip_intersects <- suppressWarnings(st_intersects(world, clipmarks_sf, sparse = FALSE))
+      clip_countries <- world[apply(clip_intersects, 1, any), ]
+      if (nrow(clip_countries) > 0) {
+        cli_alert_info("Clipmarks span {nrow(clip_countries)} countries: {paste(clip_countries$name[1:min(3, nrow(clip_countries))], collapse=', ')}{if(nrow(clip_countries) > 3) '...' else ''}")
+        
+        # Break into polygon parts to filter overseas territories
+        all_polygons <- suppressWarnings(st_cast(clip_countries, "POLYGON"))
+        polygon_intersects <- suppressWarnings(st_intersects(all_polygons, clipmarks_sf, sparse = FALSE))
+        polygon_has_data <- apply(polygon_intersects, 1, any)
+        clip_polygons <- all_polygons[polygon_has_data, ]
+        
+        data_extent <- st_bbox(clip_polygons)
+      } else {
+        cli_alert_warning("No countries found for clipmarks, falling back to data_countries")
+        extent_mode <- "data_countries"
+      }
+    }
+  }
+  
+  if (extent_mode == "data_bbox") {
+    # Raw hex data bounding box
+    data_extent <- st_bbox(hex_data)
+    cli_alert_info("Using data bbox")
+  }
+  
+  if (extent_mode == "data_countries" || is.null(data_extent)) {
+    # Countries containing hex data (default)
+    # Key improvement: break multipolygons into parts and only use parts that intersect data
+    # This prevents France's French Guiana, UK's Falklands, etc. from stretching extent
     
-    result <- st_transform(st_make_valid(world), projection)
-    st_make_valid(result)
-  }, error = function(e) {
-    cli_alert_warning("Basemap transform failed: {e$message}")
-    st_transform(world, projection)
-  })
+    hex_centroids <- suppressWarnings(st_centroid(hex_data))
+    
+    # First, find which countries have any data
+    countries_with_data <- suppressWarnings(st_intersects(world, hex_centroids, sparse = FALSE))
+    countries_with_data <- apply(countries_with_data, 1, any)
+    data_countries <- world[countries_with_data, ]
+    
+    if (nrow(data_countries) == 0) {
+      cli_alert_warning("No countries found, using data bbox")
+      data_extent <- st_bbox(hex_data)
+    } else {
+      cli_alert_info("Data spans {nrow(data_countries)} countries: {paste(data_countries$name[1:min(5, nrow(data_countries))], collapse=', ')}{if(nrow(data_countries) > 5) '...' else ''}")
+      
+      # Break multipolygons into individual polygons to handle overseas territories
+      # Countries like France (French Guiana), UK (Falklands), Netherlands (Caribbean) have
+      # distant territories that shouldn't affect extent when data is only in the main territory
+      cli_alert_info("Filtering to polygon parts containing data (excludes overseas territories)...")
+      
+      all_polygons <- suppressWarnings(st_cast(data_countries, "POLYGON"))
+      
+      # Find which individual polygons actually contain data
+      polygon_intersects <- suppressWarnings(st_intersects(all_polygons, hex_centroids, sparse = FALSE))
+      polygon_has_data <- apply(polygon_intersects, 1, any)
+      data_polygons <- all_polygons[polygon_has_data, ]
+      
+      n_total_polys <- nrow(all_polygons)
+      n_data_polys <- nrow(data_polygons)
+      if (n_data_polys < n_total_polys) {
+        cli_alert_info("Using {n_data_polys} of {n_total_polys} polygon parts (filtered distant territories)")
+      }
+      
+      # Now apply problematic country exclusion to remaining polygons
+      problematic_iso3 <- c("RUS", "USA", "FJI", "NZL", "KIR")
+      if (nrow(data_polygons) > 1) {
+        extent_polygons <- data_polygons[!data_polygons$iso_a3 %in% problematic_iso3, ]
+        if (nrow(extent_polygons) == 0) {
+          data_extent <- st_bbox(hex_data)
+        } else {
+          excluded <- unique(data_polygons$name[data_polygons$iso_a3 %in% problematic_iso3])
+          if (length(excluded) > 0) {
+            cli_alert_info("Excluded from extent: {paste(excluded, collapse=', ')}")
+          }
+          data_extent <- st_bbox(extent_polygons)
+        }
+      } else {
+        data_extent <- st_bbox(data_polygons)
+      }
+    }
+  }
+  
+  # Add buffer to extent (in degrees since we're in WGS84)
+  buffer_deg <- config$extent_buffer_km / 111  # ~111 km per degree
+  
+  xmin_wgs84 <- as.numeric(data_extent["xmin"]) - buffer_deg
+  xmax_wgs84 <- as.numeric(data_extent["xmax"]) + buffer_deg
+  ymin_wgs84 <- as.numeric(data_extent["ymin"]) - buffer_deg
+  ymax_wgs84 <- as.numeric(data_extent["ymax"]) + buffer_deg
+  
+  # Clamp to valid ranges
+
+  xmin_wgs84 <- max(xmin_wgs84, -180)
+  xmax_wgs84 <- min(xmax_wgs84, 180)
+  ymin_wgs84 <- max(ymin_wgs84, -85)
+  ymax_wgs84 <- min(ymax_wgs84, 85)
+  
+  # Calculate aspect ratio expansion in WGS84
+  output_aspect <- config$output_width / config$output_height
+  
+  lon_range <- xmax_wgs84 - xmin_wgs84
+  lat_range <- ymax_wgs84 - ymin_wgs84
+  center_lat <- (ymin_wgs84 + ymax_wgs84) / 2
+  
+  # For large extents (using Equirectangular), treat degrees as equal units
+  # For smaller extents, account for latitude distortion
+  is_large <- (lon_range > 80 || lat_range > 50)
+  
+  if (is_large) {
+    # Equirectangular: degrees map directly, so simple ratio
+    current_aspect <- lon_range / lat_range
+    
+    if (current_aspect < output_aspect) {
+      target_lon_range <- lat_range * output_aspect
+      expand_lon <- (target_lon_range - lon_range) / 2
+      xmin_wgs84 <- max(xmin_wgs84 - expand_lon, -180)
+      xmax_wgs84 <- min(xmax_wgs84 + expand_lon, 180)
+    } else {
+      target_lat_range <- lon_range / output_aspect
+      expand_lat <- (target_lat_range - lat_range) / 2
+      ymin_wgs84 <- max(ymin_wgs84 - expand_lat, -85)
+      ymax_wgs84 <- min(ymax_wgs84 + expand_lat, 85)
+    }
+  } else {
+    # Account for latitude distortion in aspect calculation
+    effective_lon_range <- lon_range * cos(center_lat * pi / 180)
+    current_aspect <- effective_lon_range / lat_range
+    
+    if (current_aspect < output_aspect) {
+      target_lon_range <- lat_range * output_aspect / cos(center_lat * pi / 180)
+      expand_lon <- (target_lon_range - lon_range) / 2
+      xmin_wgs84 <- max(xmin_wgs84 - expand_lon, -180)
+      xmax_wgs84 <- min(xmax_wgs84 + expand_lon, 180)
+    } else {
+      target_lat_range <- effective_lon_range / output_aspect
+      expand_lat <- (target_lat_range - lat_range) / 2
+      ymin_wgs84 <- max(ymin_wgs84 - expand_lat, -85)
+      ymax_wgs84 <- min(ymax_wgs84 + expand_lat, 85)
+    }
+  }
+  
+  cli_alert_info("Map extent: {round(xmin_wgs84, 1)}° to {round(xmax_wgs84, 1)}°E, {round(ymin_wgs84, 1)}° to {round(ymax_wgs84, 1)}°N")
+  
+  # Filter basemap to countries in/near the extent for performance
+  extent_box <- st_bbox(c(xmin = xmin_wgs84, ymin = ymin_wgs84, 
+                          xmax = xmax_wgs84, ymax = ymax_wgs84), 
+                        crs = st_crs(4326))
+  extent_rect <- st_as_sfc(extent_box)
+  visible_idx <- suppressWarnings(st_intersects(world, extent_rect, sparse = FALSE)[,1])
+  world_visible <- world[visible_idx, ]
+  
+  # For large extents, clip countries that span the antimeridian to avoid artifacts
+  # Instead of excluding them, we crop them to the visible extent
+  lon_span <- xmax_wgs84 - xmin_wgs84
+  if (lon_span > 100) {
+    problematic_iso3 <- c("RUS", "FJI", "KIR", "NZL", "USA", "CAN", "NOR", "ATA")
+    
+    # Separate problematic and normal countries
+    problem_countries <- world_visible[world_visible$iso_a3 %in% problematic_iso3, ]
+    normal_countries <- world_visible[!world_visible$iso_a3 %in% problematic_iso3, ]
+    
+    if (nrow(problem_countries) > 0) {
+      # Crop problematic countries to the visible extent
+      crop_box <- st_bbox(c(xmin = xmin_wgs84, ymin = ymin_wgs84, 
+                            xmax = xmax_wgs84, ymax = ymax_wgs84), 
+                          crs = st_crs(4326))
+      
+      problem_cropped <- tryCatch({
+        cropped <- suppressWarnings(st_crop(problem_countries, crop_box))
+        # Remove any empty geometries after cropping
+        cropped <- cropped[!st_is_empty(cropped), ]
+        cropped
+      }, error = function(e) {
+        cli_alert_warning("Could not crop problematic countries: {e$message}")
+        NULL
+      })
+      
+      if (!is.null(problem_cropped) && nrow(problem_cropped) > 0) {
+        cli_alert_info("Cropped {nrow(problem_cropped)} antimeridian-spanning countries to visible extent")
+        world_visible <- suppressWarnings(rbind(normal_countries, problem_cropped))
+      } else {
+        cli_alert_info("Excluded {nrow(problem_countries)} problematic countries from basemap")
+        world_visible <- normal_countries
+      }
+    }
+  }
   
   # Generate title if not provided
   if (is.null(title)) {
@@ -1026,25 +1595,27 @@ create_heatmap <- function(hex_data, projection, config, country_filter = NULL,
     colors <- viridis::plasma(n_categories, begin = 0.1, end = 0.9)
   }
   
-  # Create plot in projected coordinates
+  # Create plot - everything in WGS84, coord_sf handles projection
   p <- ggplot() +
     # Land polygons with country borders
-    geom_sf(data = world_proj, 
+    geom_sf(data = world_visible, 
             fill = config$land_color, 
             color = config$border_color, 
             linewidth = config$border_width) +
     
     # Hex bins
-    geom_sf(data = hex_proj, aes(fill = dwell_category), color = NA, alpha = 0.85) +
+    geom_sf(data = hex_data, aes(fill = dwell_category), color = NA, alpha = config$hex_alpha) +
     
     # Hex outlines - subtle for definition
-    geom_sf(data = hex_proj, fill = NA, color = "white", linewidth = 0.1, alpha = 0.3) +
+    geom_sf(data = hex_data, fill = NA, color = config$hex_border_color, 
+            linewidth = config$hex_border_width, alpha = config$hex_border_alpha) +
     
     # Clipmark hex borders
     {if (n_clipmark_hexes > 0) 
-      geom_sf(data = hex_with_clips_proj, fill = NA, 
+      geom_sf(data = hex_with_clips, fill = NA, 
               color = config$clipmark_border_color, 
-              linewidth = config$clipmark_border_width)
+              linewidth = config$clipmark_border_width,
+              alpha = config$clipmark_border_alpha)
     } +
     
     # Color scale
@@ -1054,12 +1625,15 @@ create_heatmap <- function(hex_data, projection, config, country_filter = NULL,
       drop = FALSE
     ) +
     
-    # Extent in projected coordinates - no default_crs needed
+    # Projection with WGS84 limits
+    # For large extents, disable graticule (datum=NA) to avoid artifacts
     coord_sf(
-      xlim = c(xmin, xmax),
-      ylim = c(ymin, ymax),
+      xlim = c(xmin_wgs84, xmax_wgs84),
+      ylim = c(ymin_wgs84, ymax_wgs84),
       expand = FALSE,
-      datum = sf::st_crs(projection)  # Use projection for graticule
+      crs = projection,
+      default_crs = sf::st_crs(4326),
+      datum = if (is_large) NA else sf::st_crs(4326)
     ) +
     
     # Labels
@@ -1166,6 +1740,12 @@ process_coordinates <- function(coord_data, clipmark_data, config, projection,
   # Flag hexes containing clipmarks
   hex_data <- flag_clipmark_hexes_fast(hex_data, clipmark_data, config)
   
+  # Convert clipmarks to sf for extent calculation (if needed)
+  clipmarks_sf <- NULL
+  if (nrow(clipmark_data) > 0) {
+    clipmarks_sf <- st_as_sf(clipmark_data, coords = c("lon", "lat"), crs = 4326)
+  }
+  
   # Create plot
   plot_title <- paste0(title_prefix, " - ", subtitle_suffix)
   
@@ -1173,8 +1753,7 @@ process_coordinates <- function(coord_data, clipmark_data, config, projection,
     hex_data, 
     projection,
     config,
-    config$country_filter,
-    config$extent_buffer_km,
+    clipmarks_sf = clipmarks_sf,
     title = plot_title
   )
   
@@ -1228,7 +1807,7 @@ run_analysis <- function(config, col_map) {
   )
   class(data_bbox) <- "bbox"
   attr(data_bbox, "crs") <- st_crs(4326)
-  projection <- choose_projection_from_bbox(data_bbox, config$country_filter, config$projection_override)
+  projection <- choose_projection_from_bbox(data_bbox, config)
   
   # Create title prefix
   title_prefix <- if (!is.null(config$mission_ids)) {
@@ -1272,30 +1851,34 @@ run_analysis <- function(config, col_map) {
     results$output_files$frame_center <- frame_file
   }
   
-  # Process Aircraft Position data (if available)
-  if (!is.null(aircraft_data) && nrow(aircraft_data) > 0) {
-    cli_h2("Processing Aircraft Position Heatmap")
-    aircraft_result <- process_coordinates(
-      aircraft_data, clipmark_data, config, projection,
-      title_prefix, "Aircraft Position"
-    )
-    
-    if (!is.null(aircraft_result)) {
-      aircraft_file <- paste0(base_name, "_aircraft.", file_ext)
-      cli_alert("Saving to {aircraft_file}...")
-      ggsave(
-        aircraft_file, 
-        plot = aircraft_result$plot, 
-        width = config$output_width, 
-        height = config$output_height, 
-        dpi = config$output_dpi
+  # Process Aircraft Position data (if enabled and available)
+  if (config$generate_aircraft_map) {
+    if (!is.null(aircraft_data) && nrow(aircraft_data) > 0) {
+      cli_h2("Processing Aircraft Position Heatmap")
+      aircraft_result <- process_coordinates(
+        aircraft_data, clipmark_data, config, projection,
+        title_prefix, "Aircraft Position"
       )
-      cli_alert_success("Saved: {aircraft_file}")
-      results$plots$aircraft <- aircraft_result$plot
-      results$output_files$aircraft <- aircraft_file
+      
+      if (!is.null(aircraft_result)) {
+        aircraft_file <- paste0(base_name, "_aircraft.", file_ext)
+        cli_alert("Saving to {aircraft_file}...")
+        ggsave(
+          aircraft_file, 
+          plot = aircraft_result$plot, 
+          width = config$output_width, 
+          height = config$output_height, 
+          dpi = config$output_dpi
+        )
+        cli_alert_success("Saved: {aircraft_file}")
+        results$plots$aircraft <- aircraft_result$plot
+        results$output_files$aircraft <- aircraft_file
+      }
+    } else {
+      cli_alert_warning("Aircraft position data not available - skipping aircraft heatmap")
     }
   } else {
-    cli_alert_warning("Aircraft position data not available - skipping aircraft heatmap")
+    cli_alert_info("Aircraft map generation disabled (config$generate_aircraft_map = FALSE)")
   }
   
   # Cleanup
@@ -1320,7 +1903,7 @@ run_analysis <- function(config, col_map) {
 # generate_synthetic_data(output_dir = config$data_dir, n_missions = 5)
 
 # Run the analysis:
-result <- run_analysis(config, col_map)
+# result <- run_analysis(config, col_map)
 
 # To display interactively:
 # print(result$plots$frame_center)
@@ -1329,8 +1912,15 @@ result <- run_analysis(config, col_map)
 cat("\n")
 cli_alert_info("Script loaded. To run:")
 cat("
-1. Generate test data (if needed):
+1. Generate test data:
+   
+   OPTION A - Random missions (original):
    generate_synthetic_data(output_dir = config$data_dir, n_missions = 5)
+   
+   OPTION B - From KML route files:
+   # Create .kml files with LineString paths (e.g., from Google Earth)
+   # Place them in data/routes/ folder, then:
+   generate_from_kml(kml_dir = 'data/routes', output_dir = config$data_dir)
 
 2. Adjust 'config' settings at top of script
 
@@ -1347,4 +1937,9 @@ cat("
 Output generates TWO maps per run:
   - *_framecenter.png  - Where the camera was looking
   - *_aircraft.png     - Where the aircraft was flying
+
+KML Route Tips:
+  - Draw paths in Google Earth Pro, save as KML (not KMZ)
+  - Each .kml file becomes one mission
+  - Routes can cross datelines, poles, etc. for projection testing
 ")
