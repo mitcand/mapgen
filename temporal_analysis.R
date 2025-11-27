@@ -55,7 +55,7 @@ config <- list(
   # === DATA SOURCE ===
   data_dir = "data/missions",           # Folder containing CSV files
   db_path = "missions.duckdb",          # DuckDB database path (created automatically)
-  use_existing_db = TRUE,              # TRUE = reuse existing DB, FALSE = reimport CSVs
+  use_existing_db = FALSE,              # TRUE = reuse existing DB, FALSE = reimport CSVs
   
   # === QUERY FILTERS ===
   # Use ONE of these approaches to filter data:
@@ -65,16 +65,21 @@ config <- list(
   date_start = NULL,                    # e.g., "2024-01-01" or NULL
   date_end = NULL,                      # e.g., "2024-03-31" or NULL
   
+  # === DATA PARAMETERS ===
+  sample_rate_hz = 15,                  # Vuefast data sample rate in Hz (samples per second)
+  
   # === TIMEZONE LOOKUP ===
   # Method for looking up timezones from coordinates (via lutz package)
   # "fast"     - Very fast, uses Rcpp. May be inaccurate near timezone borders.
   # "accurate" - Slower, uses sf spatial join. More accurate near borders.
-  tz_lookup_method = "accurate",
+  tz_lookup_method = "fast",
   
   # === DISPLAY ===
   max_countries = 12,                   # Maximum countries to display in faceted plots
-  vertical_layout = TRUE,              # TRUE = single column with axis labels between facets
+  vertical_layout = FALSE,              # TRUE = single column with axis labels between facets
                                         # FALSE = grid layout (default)
+  facet_cols_dow = 4,                   # Number of columns for day-of-week grid layout
+  facet_cols_tod = 3,                   # Number of columns for time-of-day grid layout
   
   # === COLORS ===
   # Heatmap colors (low to high dwell time) - gradient for time intensity
@@ -335,6 +340,10 @@ assign_countries_and_timezones <- function(coords_df, config, lat_col = "lat", l
       method = config$tz_lookup_method
     )
   )
+  
+  # Handle multiple timezones (e.g., "Asia/Hebron; Asia/Jerusalem" for disputed areas)
+  # Take just the first timezone
+  tz_names <- sapply(strsplit(tz_names, ";"), function(x) trimws(x[1]))
   
   # Create lookup table
   cell_lookup <- data.frame(
@@ -710,7 +719,7 @@ create_dow_heatmap <- function(agg_data, country_order, country_name_map, config
                                          sprintf("%.1f", minutes)), 
                                   "")),
               color = config$text_color, size = 3) +
-    facet_wrap(~ country, ncol = 4, labeller = labeller(country = facet_labels)) +
+    facet_wrap(~ country, ncol = config$facet_cols_dow, labeller = labeller(country = facet_labels)) +
     scale_fill_gradientn(
       colors = config$heatmap_colors,
       limits = c(0, max_minutes),
@@ -820,7 +829,7 @@ create_tod_heatmap <- function(agg_data, country_order, country_tz_map, country_
   
   p <- ggplot(plot_data, aes(x = time_slot, y = 1, fill = minutes)) +
     geom_tile(color = NA) +
-    facet_wrap(~ country, ncol = 3, labeller = labeller(country = facet_labels)) +
+    facet_wrap(~ country, ncol = config$facet_cols_tod, labeller = labeller(country = facet_labels)) +
     scale_fill_gradientn(
       colors = config$heatmap_colors,
       limits = c(0, max_minutes),
@@ -1252,7 +1261,8 @@ run_temporal_analysis <- function(config, col_map) {
     vuefast_data <- add_local_time_components(vuefast_data, "timestamp_utc")
     
     # Get country order by total time
-    country_totals <- get_country_totals(vuefast_data, is_clipmarks = FALSE)
+    country_totals <- get_country_totals(vuefast_data, is_clipmarks = FALSE, 
+                                          sample_rate_hz = config$sample_rate_hz)
     country_order <- country_totals$country
     
     if (length(country_order) > 0) {
@@ -1260,7 +1270,8 @@ run_temporal_analysis <- function(config, col_map) {
       # --- 1a: Day of Week ---
       cli_h3("1a. Day of Week - Aircraft Position")
       
-      dow_agg <- aggregate_by_country_dow(vuefast_data, is_clipmarks = FALSE)
+      dow_agg <- aggregate_by_country_dow(vuefast_data, is_clipmarks = FALSE,
+                                           sample_rate_hz = config$sample_rate_hz)
       
       if (nrow(dow_agg) > 0) {
         # Choose layout based on config
@@ -1303,7 +1314,8 @@ run_temporal_analysis <- function(config, col_map) {
       # --- 2a: Time of Day ---
       cli_h3("2a. Time of Day - Aircraft Position (Local Timezones with DST)")
       
-      tod_agg <- aggregate_by_country_tod(vuefast_data, is_clipmarks = FALSE)
+      tod_agg <- aggregate_by_country_tod(vuefast_data, is_clipmarks = FALSE,
+                                           sample_rate_hz = config$sample_rate_hz)
       
       if (nrow(tod_agg) > 0) {
         # Choose layout based on config

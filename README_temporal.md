@@ -1,18 +1,18 @@
 # Temporal Dwell Time Analysis
 
-A companion tool to the Hex Bin Dwell Time Analysis for visualizing **when** camera attention occurred during high-altitude aircraft scientific missions. Generates faceted heatmaps showing dwell time patterns by day of week and time of day, with each country displayed in its local timezone including automatic daylight saving time handling.
+Analyzes **when** camera attention occurred during high-altitude aircraft scientific missions. Generates faceted heatmaps showing dwell time patterns by day of week and time of day, with automatic local timezone conversion including daylight saving time handling.
 
 ## Table of Contents
 
 - [Overview](#overview)
 - [Quick Start](#quick-start)
 - [Installation](#installation)
-- [Configuration](#configuration)
+- [Configuration Reference](#configuration-reference)
+- [Column Mapping](#column-mapping)
 - [Input Data Format](#input-data-format)
 - [Usage Examples](#usage-examples)
 - [Output](#output)
 - [Timezone Handling](#timezone-handling)
-- [Customization Guide](#customization-guide)
 - [Troubleshooting](#troubleshooting)
 - [Technical Notes](#technical-notes)
 
@@ -39,12 +39,12 @@ The script generates four faceted heatmaps:
 
 ### Key Features
 
-- **Automatic timezone lookup**: Uses `lutz` package to determine timezone from coordinates
-- **Daylight saving time support**: Properly handles DST transitions via `lubridate`
-- **Accurate country detection**: Uses Natural Earth boundaries via spatial join
-- **Grid-based optimization**: Processes millions of points efficiently
-- **Shared database**: Uses same DuckDB backend as hexbin analysis
-- **Consistent styling**: Dark theme matching the hexbin heatmaps
+- **Automatic timezone lookup** from coordinates using `lutz` package
+- **Automatic DST handling** - correctly handles data spanning entire years
+- **Full country names** in facet labels with UTC offset
+- **Two layout options** - grid or vertical single-column
+- **Accurate country detection** using Natural Earth boundaries
+- **Configurable sample rate** for different sensor frequencies
 
 ---
 
@@ -75,7 +75,7 @@ result$output_files
 
 ### Required R Packages
 
-The script will attempt to install missing packages automatically, but you can install them manually:
+The script will attempt to install missing packages automatically:
 
 ```r
 install.packages(c(
@@ -85,8 +85,9 @@ install.packages(c(
   "rnaturalearth",            # Country boundaries
   "rnaturalearthdata",
   "dplyr", "tidyr",           # Data manipulation
-  "lubridate",                # Date/time handling with DST support
+  "lubridate",                # Date/time handling
   "lutz",                     # Timezone lookup from coordinates
+  "patchwork", "cowplot",     # Plot composition
   "glue", "cli"               # Utilities
 ))
 
@@ -99,79 +100,99 @@ install.packages("rnaturalearthhires",
 
 - R version 4.0 or higher
 - ~4GB RAM for datasets with 10-20 million points
-- Sufficient disk space for DuckDB database
 
 ---
 
-## Configuration
+## Configuration Reference
 
 All configuration is at the top of the script in the `config` list.
 
-### Data Source Settings
+### Data Source
 
-```r
-config <- list(
-  data_dir = "data/missions",    # Folder containing your CSV files
-  db_path = "missions.duckdb",   # Database file (shared with hexbin script)
-  use_existing_db = FALSE,       # Set TRUE after first run to skip import
-  ...
-)
-```
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `data_dir` | `"data/missions"` | Folder containing CSV files |
+| `db_path` | `"missions.duckdb"` | DuckDB database path (created automatically) |
+| `use_existing_db` | `FALSE` | `TRUE` = reuse existing DB, `FALSE` = reimport CSVs |
 
-**Tip**: If you've already run the hexbin analysis, set `use_existing_db = TRUE` to reuse the imported data.
+**Tip**: Set `use_existing_db = TRUE` after the first run to skip CSV import.
 
 ### Query Filters
 
-Filter data the same way as the hexbin script:
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `mission_ids` | `NULL` | Vector of mission IDs, e.g., `c("M2024001", "M2024002")`. `NULL` = all missions |
+| `date_start` | `NULL` | Start date filter, e.g., `"2024-01-01"` |
+| `date_end` | `NULL` | End date filter, e.g., `"2024-03-31"` |
 
-**Option A: By Mission ID**
-```r
-config$mission_ids <- c("M2024001", "M2024002")  # Specific missions
-config$mission_ids <- NULL                        # All missions
-```
+### Data Parameters
 
-**Option B: By Date Range**
-```r
-config$mission_ids <- NULL
-config$date_start <- "2024-01-01"
-config$date_end <- "2024-03-31"
-```
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `sample_rate_hz` | `15` | Vuefast data sample rate in Hz (samples per second). Used to convert sample counts to minutes. |
 
-### Timezone Lookup Method
+### Timezone Lookup
 
-```r
-config$tz_lookup_method <- "fast"      # Fast Rcpp lookup (default)
-config$tz_lookup_method <- "accurate"  # Slower sf spatial join
-```
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `tz_lookup_method` | `"fast"` | Method for timezone lookup: `"fast"` (Rcpp, may be inaccurate near borders) or `"accurate"` (sf spatial join, slower but precise) |
 
-| Method | Speed | Accuracy | Best For |
-|--------|-------|----------|----------|
-| `fast` | ~10x faster | Good except near borders | Most use cases |
-| `accurate` | Slower | Precise at borders | Critical timezone needs |
+### Display
 
-### Display Settings
-
-```r
-config$max_countries <- 12      # Maximum countries to show in facets
-config$vertical_layout <- FALSE # Set TRUE for single-column stacked layout
-```
-
-**Layout options:**
-- `vertical_layout = FALSE` (default): Grid layout with multiple columns
-- `vertical_layout = TRUE`: Single column with facets stacked vertically. Each row has its own time/day axis labels for easy reading at any point in the image. Country labels appear on the left. Output height adjusts automatically based on the number of countries.
-
-Facets are ordered by total dwell time (highest first), so you'll always see the most active countries.
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_countries` | `12` | Maximum countries to display in faceted plots |
+| `vertical_layout` | `FALSE` | `TRUE` = single column with axis labels on each row; `FALSE` = grid layout |
+| `facet_cols_dow` | `4` | Number of columns for day-of-week grid layout |
+| `facet_cols_tod` | `3` | Number of columns for time-of-day grid layout |
 
 ### Colors
 
-```r
-# Heatmap gradient (low to high time)
-config$heatmap_colors <- c("#285DAB", "#5EA5DA", "#F1DCAA", "#F9A63F", "#CD5821")
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `heatmap_colors` | `c("#285DAB", "#5EA5DA", "#F1DCAA", "#F9A63F", "#CD5821")` | Gradient colors from low to high dwell time |
+| `background_color` | `"#1a1a1a"` | Plot background color |
+| `text_color` | `"#ffffff"` | Text and label color |
+| `grid_color` | `"#333333"` | Grid lines between tiles |
 
-# Dark theme (matches hexbin maps)
-config$background_color <- "#1a1a1a"
-config$text_color <- "#ffffff"
+### Output
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `output_dir` | `"output"` | Directory for saved images |
+| `output_format` | `"png"` | Format: `"png"`, `"pdf"`, or `"jpg"` |
+| `output_width` | `14` | Image width in inches (grid layout) |
+| `output_height` | `10` | Image height in inches (grid layout) |
+| `output_dpi` | `300` | Resolution (300 = print quality) |
+
+**Note**: Vertical layout automatically calculates dimensions based on number of countries.
+
+---
+
+## Column Mapping
+
+Update `col_map` to match your CSV column names:
+
+```r
+col_map <- list(
+  # VUEFAST columns (15 Hz sensor data)
+  timestamp = "timestamp",           # Timestamp column
+  frame_lat = "frame_center_lat",    # Camera frame center latitude
+  frame_lon = "frame_center_lon",    # Camera frame center longitude
+  
+  # CLIPMARKS columns (crew-marked points of interest)
+  clip_start_time = "start_time",    # Clip start timestamp
+  clip_end_time = "end_time",        # Clip end timestamp
+  clip_lat = "poi_lat",              # Point of interest latitude
+  clip_lon = "poi_lon"               # Point of interest longitude
+)
 ```
+
+### Finding Your Column Names
+
+1. Open one of your vuefast CSV files
+2. Look at the header row
+3. Replace the placeholder names with your actual column names
 
 ---
 
@@ -179,31 +200,10 @@ config$text_color <- "#ffffff"
 
 ### Required Files
 
-Uses the same files as the hexbin analysis:
-
 | File Pattern | Description | Required |
 |--------------|-------------|----------|
 | `<mission_id>_vuefast.csv` | 15 Hz sensor data | **Yes** |
 | `<mission_id>_clipmarks.csv` | Crew-marked POIs | No (but recommended) |
-
-### Column Mapping
-
-Update `col_map` to match your CSV column names:
-
-```r
-col_map <- list(
-  # VUEFAST columns
-  timestamp = "your_timestamp_column",
-  frame_lat = "your_frame_lat_column",
-  frame_lon = "your_frame_lon_column",
-  
-  # CLIPMARKS columns
-  clip_start_time = "your_start_time_column",
-  clip_end_time = "your_end_time_column",
-  clip_lat = "your_poi_lat_column",
-  clip_lon = "your_poi_lon_column"
-)
-```
 
 ### Timestamp Format
 
@@ -242,10 +242,17 @@ config$date_end <- "2024-06-30"
 result <- run_temporal_analysis(config, col_map)
 ```
 
-### Quick Re-run (Skip Import)
+### Use Vertical Layout
 
 ```r
-config$use_existing_db <- TRUE
+config$vertical_layout <- TRUE
+result <- run_temporal_analysis(config, col_map)
+```
+
+### Adjust for Different Sample Rate
+
+```r
+config$sample_rate_hz <- 10  # For 10 Hz data instead of 15 Hz
 result <- run_temporal_analysis(config, col_map)
 ```
 
@@ -271,11 +278,6 @@ Four image files are saved to `config$output_dir`:
 | Time of Day - Aircraft | `{prefix}_tod_vuefast_{timestamp}.png` |
 | Time of Day - Clipmarks | `{prefix}_tod_clipmarks_{timestamp}.png` |
 
-Where `{prefix}` is:
-- Mission IDs: `M2024001_M2024002`
-- Date range: `90days`
-- All missions: `all_missions`
-
 ### Accessing Results
 
 ```r
@@ -289,24 +291,24 @@ result$plots$tod_clipmarks
 
 # File paths
 result$output_files$dow_vuefast
-# etc.
-
-# Display a plot
-print(result$plots$tod_vuefast)
 ```
 
 ### Reading the Plots
 
 **Day of Week Heatmaps:**
-- Facet labels show full country name and total time (e.g., "Iran (73.1 hrs)")
-- X-axis: Monday through Sunday (in local time)
+- Facet labels show full country name and total time
+- X-axis: Monday through Sunday
 - Each cell shows minutes of dwell time
-- Values printed in cells for easy reading
 
 **Time of Day Heatmaps:**
 - Facet labels show full country name, total time, and UTC offset
 - X-axis: 00:00 to 24:00 in 30-minute slots
-- Times are LOCAL to each country with DST applied
+- Times are LOCAL to each country
+
+**Vertical Layout:**
+- Each row has its own time/day axis labels for easy reading
+- Country labels on the left side
+- Useful for tall displays or printing
 
 ---
 
@@ -316,82 +318,30 @@ print(result$plots$tod_vuefast)
 
 1. **Timezone Lookup**: The `lutz` package determines the IANA timezone (e.g., "Asia/Tehran") from each point's coordinates
 
-2. **Grid Optimization**: To avoid looking up 20M+ points individually:
-   - Coordinates are rounded to a 0.1° grid (~10km)
-   - Timezone is looked up once per unique grid cell
-   - Results are applied to all points in that cell
+2. **Grid Optimization**: Coordinates are rounded to a 0.1° grid (~10km). Timezone is looked up once per unique grid cell, then applied to all points in that cell.
 
-3. **Automatic DST Handling**: `lubridate::with_tz()` converts each UTC timestamp to local time, automatically applying the correct offset based on that specific timestamp's date. Data spanning an entire year will have DST transitions handled correctly - no manual configuration needed.
-
-### Example
-
-A point at coordinates in Iran on March 20, 2024:
-- `lutz` returns: `"Asia/Tehran"`
-- UTC timestamp: `2024-03-20 10:00:00 UTC`
-- Iran observes DST starting March 21, so on March 20:
-  - Standard time offset: UTC+3:30
-  - Local time: `2024-03-20 13:30:00` (1:30 PM)
-
-The same point on March 22 (after DST starts):
-- UTC timestamp: `2024-03-22 10:00:00 UTC`
-- DST offset: UTC+4:30
-- Local time: `2024-03-22 14:30:00` (2:30 PM)
-
-**Note**: The UTC offset shown in facet labels reflects the *current* offset (at time of running the script), but the actual time conversion for each data point uses the historically correct offset for that timestamp's date.
+3. **Automatic DST**: `lubridate::with_tz()` converts each UTC timestamp to local time, automatically applying the correct offset based on that specific timestamp's date. Data spanning an entire year will have DST transitions handled correctly.
 
 ### Timezone Display
 
-Each facet label shows the full country name and UTC offset:
+Each time-of-day facet label shows the full country name and UTC offset:
 ```
 Iran (73.1 hrs)
 UTC+3:30
 ```
 
-Fractional offsets are displayed with minutes (e.g., "UTC+3:30" for Iran, "UTC+5:45" for Nepal).
+**Note**: The displayed UTC offset reflects the current offset (when the script runs), but the actual time conversion for each data point uses the historically correct offset for that timestamp's date.
 
 ### Countries with Multiple Timezones
 
-For countries spanning multiple timezones (Russia, USA, Kazakhstan, etc.), the script:
-1. Looks up the actual timezone for each point's coordinates
-2. Displays the most common timezone in that country's facet label
-3. Still uses the correct local time for each individual point
+For countries spanning multiple timezones (Russia, Kazakhstan, etc.):
+1. Each point gets the correct timezone for its coordinates
+2. The facet label shows the most common timezone in that country's data
+3. Individual points still use their correct local time
 
----
+### Disputed Areas
 
-## Customization Guide
-
-### Changing Colors
-
-```r
-# Blue to red gradient
-config$heatmap_colors <- c("#313695", "#4575b4", "#ffffbf", "#f46d43", "#a50026")
-
-# Viridis-style
-config$heatmap_colors <- c("#440154", "#3b528b", "#21918c", "#5ec962", "#fde725")
-```
-
-### Adjusting Number of Countries
-
-```r
-config$max_countries <- 8    # Show fewer countries (larger facets)
-config$max_countries <- 16   # Show more countries (smaller facets)
-```
-
-### Changing Output Format
-
-```r
-config$output_format <- "pdf"   # Vector format for reports
-config$output_format <- "png"   # Raster for presentations
-config$output_format <- "jpg"   # Smaller file size
-```
-
-### Adjusting Plot Dimensions
-
-```r
-config$output_width <- 16    # Wider for more countries
-config$output_height <- 12   # Taller for more detail
-config$output_dpi <- 150     # Lower DPI for faster saves
-```
+Some regions return multiple overlapping timezones (e.g., "Asia/Hebron; Asia/Jerusalem"). The script automatically uses the first timezone listed.
 
 ---
 
@@ -401,33 +351,22 @@ config$output_dpi <- 150     # Lower DPI for faster saves
 
 - Check that `config$data_dir` points to the correct folder
 - Verify files are named `<something>_vuefast.csv`
-- Run `generate_synthetic_data()` from hexbin script to create test data
 
 ### "Column not found" errors
 
 - Update `col_map` to match your actual CSV column names
 - Check for typos and case sensitivity
 
-### Script hangs during "Assigning countries and timezones"
+### Incorrect dwell times
 
-This step does spatial joins, which can take a few minutes for 20M+ points. The grid-based optimization helps, but very large datasets may still take time.
+- Verify `config$sample_rate_hz` matches your actual data rate
+- Default is 15 Hz; adjust if your sensor runs at a different frequency
 
-If it takes more than 5-10 minutes:
-- Check available RAM
-- Filter to fewer missions
-- Consider using `tz_lookup_method = "fast"`
+### Script runs slowly
 
-### Unexpected local times
-
-- Verify your input timestamps are in UTC
-- Check that coordinates are valid (lat: -90 to 90, lon: -180 to 180)
-- Try `tz_lookup_method = "accurate"` for border regions
-
-### "Error in with_tz" or timezone errors
-
-- Ensure `lubridate` package is up to date
-- Some obscure timezone names may not be recognized by R
-- Check R's timezone database: `OlsonNames()`
+- Use `config$tz_lookup_method = "fast"` instead of "accurate"
+- Filter to fewer missions or a shorter date range
+- Set `config$use_existing_db = TRUE` after first run
 
 ### Database errors
 
@@ -440,38 +379,16 @@ If it takes more than 5-10 minutes:
 
 ### Country Assignment
 
-Uses Natural Earth boundaries via `sf` spatial join:
+Uses Natural Earth boundaries (scale 50) via `sf` spatial join:
+1. Round coordinates to 0.1° grid (~10km cells)
+2. Spatial join grid cells to country polygons
+3. Apply country code to all points in each cell
 
-1. Round all coordinates to 0.1° grid (~10km cells)
-2. Get unique grid cells (typically 10-50K instead of millions)
-3. Spatial join grid cells to country polygons
-4. Lookup timezone for each grid cell via `lutz`
-5. Apply country and timezone to all points
+### Timezone Lookup
 
-### Timezone Lookup with lutz
-
-The `lutz` package provides two methods:
-
-| Method | Implementation | Pros | Cons |
-|--------|----------------|------|------|
-| `fast` | Rcpp + precomputed grid | Very fast, works in oceans | Less accurate near borders |
-| `accurate` | sf spatial join | Precise boundaries | Slower, requires sf |
-
-### DST Handling
-
-`lubridate::with_tz()` handles DST correctly:
-- Uses the system's timezone database (Olson/IANA)
-- Applies DST rules based on the actual date of each timestamp
-- Handles historical DST changes
-
-### Data Flow
-
-```
-CSV Files → DuckDB → Query → Coordinate Validation → 
-  → Grid-based Country + Timezone Assignment → 
-  → DST-aware Local Time Conversion → 
-  → Aggregate by Country + Time Dimension → Plot → Save
-```
+Uses `lutz` package with two methods:
+- `"fast"`: Rcpp-based, works in international waters, ~10x faster
+- `"accurate"`: sf spatial join with detailed timezone boundaries
 
 ### Performance
 
@@ -483,7 +400,6 @@ CSV Files → DuckDB → Query → Coordinate Validation →
 
 ### Memory Usage
 
-Approximate memory needs (similar to hexbin script):
 - 1 million points: ~500 MB
 - 10 million points: ~2-3 GB
 - 20 million points: ~4-5 GB
@@ -492,27 +408,16 @@ Approximate memory needs (similar to hexbin script):
 
 ## Relationship to Hexbin Analysis
 
-This script is designed to work alongside `hexbin_dwell_analysis.R`:
+This script works alongside `hexbin_dwell_analysis.R`:
 
 | Aspect | Hexbin | Temporal |
 |--------|--------|----------|
 | Focus | Where (geography) | When (time patterns) |
 | Output | Map with hex bins | Faceted heatmaps |
 | Database | Creates DuckDB | Can reuse same DB |
-| Countries | Optional filter | Automatic faceting |
-| Timezones | N/A | Automatic via lutz |
 
-**Workflow tip**: Run hexbin first to identify countries of interest, then run temporal to understand when activity occurred in those countries.
+**Workflow tip**: Run hexbin first to identify countries of interest, then run temporal to understand when activity occurred.
 
 ---
 
-## Support
-
-For issues or questions:
-1. Check [Troubleshooting](#troubleshooting) section
-2. Review console output for error messages
-3. Verify input data format matches expected structure
-
----
-
-*Generated with Claude AI assistance - Version 1.2*
+*Generated with Claude AI assistance*
