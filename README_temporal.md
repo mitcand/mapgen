@@ -153,7 +153,12 @@ config$tz_lookup_method <- "accurate"  # Slower sf spatial join
 
 ```r
 config$max_countries <- 12      # Maximum countries to show in facets
+config$vertical_layout <- FALSE # Set TRUE for single-column stacked layout
 ```
+
+**Layout options:**
+- `vertical_layout = FALSE` (default): Grid layout with multiple columns
+- `vertical_layout = TRUE`: Single column with facets stacked vertically. Each row has its own time/day axis labels for easy reading at any point in the image. Country labels appear on the left. Output height adjusts automatically based on the number of countries.
 
 Facets are ordered by total dwell time (highest first), so you'll always see the most active countries.
 
@@ -293,13 +298,14 @@ print(result$plots$tod_vuefast)
 ### Reading the Plots
 
 **Day of Week Heatmaps:**
+- Facet labels show full country name and total time (e.g., "Iran (73.1 hrs)")
 - X-axis: Monday through Sunday (in local time)
 - Each cell shows minutes of dwell time
 - Values printed in cells for easy reading
 
 **Time of Day Heatmaps:**
+- Facet labels show full country name, total time, and UTC offset
 - X-axis: 00:00 to 24:00 in 30-minute slots
-- Facet labels show timezone name: `IRN (73.1 hrs)\nTehran`
 - Times are LOCAL to each country with DST applied
 
 ---
@@ -315,7 +321,7 @@ print(result$plots$tod_vuefast)
    - Timezone is looked up once per unique grid cell
    - Results are applied to all points in that cell
 
-3. **DST Conversion**: `lubridate::with_tz()` converts each UTC timestamp to local time, properly handling daylight saving time based on the actual date
+3. **Automatic DST Handling**: `lubridate::with_tz()` converts each UTC timestamp to local time, automatically applying the correct offset based on that specific timestamp's date. Data spanning an entire year will have DST transitions handled correctly - no manual configuration needed.
 
 ### Example
 
@@ -331,15 +337,17 @@ The same point on March 22 (after DST starts):
 - DST offset: UTC+4:30
 - Local time: `2024-03-22 14:30:00` (2:30 PM)
 
+**Note**: The UTC offset shown in facet labels reflects the *current* offset (at time of running the script), but the actual time conversion for each data point uses the historically correct offset for that timestamp's date.
+
 ### Timezone Display
 
-Each facet label shows the primary timezone for that country:
+Each facet label shows the full country name and UTC offset:
 ```
-IRN (73.1 hrs)
-Tehran
+Iran (73.1 hrs)
+UTC+3:30
 ```
 
-The timezone name is simplified from the full IANA name (e.g., "Asia/Tehran" → "Tehran").
+Fractional offsets are displayed with minutes (e.g., "UTC+3:30" for Iran, "UTC+5:45" for Nepal).
 
 ### Countries with Multiple Timezones
 

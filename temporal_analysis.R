@@ -55,7 +55,7 @@ config <- list(
   # === DATA SOURCE ===
   data_dir = "data/missions",           # Folder containing CSV files
   db_path = "missions.duckdb",          # DuckDB database path (created automatically)
-  use_existing_db = FALSE,              # TRUE = reuse existing DB, FALSE = reimport CSVs
+  use_existing_db = TRUE,              # TRUE = reuse existing DB, FALSE = reimport CSVs
   
   # === QUERY FILTERS ===
   # Use ONE of these approaches to filter data:
@@ -69,10 +69,12 @@ config <- list(
   # Method for looking up timezones from coordinates (via lutz package)
   # "fast"     - Very fast, uses Rcpp. May be inaccurate near timezone borders.
   # "accurate" - Slower, uses sf spatial join. More accurate near borders.
-  tz_lookup_method = "fast",
+  tz_lookup_method = "accurate",
   
   # === DISPLAY ===
   max_countries = 12,                   # Maximum countries to display in faceted plots
+  vertical_layout = TRUE,              # TRUE = single column with axis labels between facets
+                                        # FALSE = grid layout (default)
   
   # === COLORS ===
   # Heatmap colors (low to high dwell time) - gradient for time intensity
@@ -145,7 +147,8 @@ required_packages <- c(
   "rnaturalearth", "rnaturalearthdata", # Basemaps/country boundaries
   "dplyr", "tidyr", "lubridate",        # Data manipulation
   "glue", "cli",                        # Utilities
-  "lutz"                                # Timezone lookup from coordinates
+  "lutz",                               # Timezone lookup from coordinates
+  "patchwork", "cowplot"                # Plot composition (for vertical layout)
 )
 
 for (pkg in required_packages) {
@@ -325,10 +328,12 @@ assign_countries_and_timezones <- function(coords_df, config, lat_col = "lat", l
   
   # Lookup timezones using lutz
   cli_alert("Looking up timezones (method: {config$tz_lookup_method})...")
-  tz_names <- tz_lookup_coords(
-    lat = unique_cells$grid_lat,
-    lon = unique_cells$grid_lon,
-    method = config$tz_lookup_method
+  tz_names <- suppressWarnings(
+    tz_lookup_coords(
+      lat = unique_cells$grid_lat,
+      lon = unique_cells$grid_lon,
+      method = config$tz_lookup_method
+    )
   )
   
   # Create lookup table
@@ -627,12 +632,36 @@ get_country_primary_timezone <- function(data) {
   setNames(tz_by_country$tz, tz_by_country$country)
 }
 
+get_country_names <- function() {
+  #' Get a mapping of ISO3 country codes to full country names
+  #'
+  #' @return Named vector: ISO3 code -> country name
+  
+  countries <- ne_countries(scale = 50, returnclass = "sf")
+  
+  # Create named vector: iso_a3 -> name
+  name_map <- setNames(countries$name, countries$iso_a3)
+  
+  # Remove any -99 entries
+
+  name_map <- name_map[names(name_map) != "-99"]
+  
+  return(name_map)
+}
+
 # ------------------------------------------------------------------------------
 # PLOTTING FUNCTIONS
 # ------------------------------------------------------------------------------
 
-create_dow_heatmap <- function(agg_data, country_order, config, title, subtitle = NULL) {
+create_dow_heatmap <- function(agg_data, country_order, country_name_map, config, title, subtitle = NULL) {
   #' Create faceted day-of-week heatmap
+  #'
+ #' @param agg_data Aggregated data by country and day_of_week
+  #' @param country_order Vector of country codes in display order
+  #' @param country_name_map Named vector mapping ISO3 -> full country name
+  #' @param config Configuration list
+  #' @param title Plot title
+  #' @param subtitle Plot subtitle
   
   day_labels <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
   
@@ -654,11 +683,17 @@ create_dow_heatmap <- function(agg_data, country_order, config, title, subtitle 
   # Calculate totals for facet labels
   country_totals <- plot_data %>%
     group_by(country) %>%
-    summarise(total = sum(minutes), .groups = "drop")
+    summarise(total = sum(minutes), .groups = "drop") %>%
+    mutate(
+      # Get full country name, fall back to ISO3 code if not found
+      country_name = sapply(as.character(country), function(iso) {
+        if (iso %in% names(country_name_map)) country_name_map[[iso]] else iso
+      })
+    )
   
-  # Create facet labels with totals
+  # Create facet labels with full country name and totals
   facet_labels <- setNames(
-    paste0(country_totals$country, "\n(", 
+    paste0(country_totals$country_name, "\n(", 
            ifelse(country_totals$total >= 60, 
                   paste0(round(country_totals$total / 60, 1), " hrs"),
                   paste0(round(country_totals$total, 0), " min")),
@@ -707,13 +742,14 @@ create_dow_heatmap <- function(agg_data, country_order, config, title, subtitle 
   return(p)
 }
 
-create_tod_heatmap <- function(agg_data, country_order, country_tz_map, config, title, subtitle = NULL) {
+create_tod_heatmap <- function(agg_data, country_order, country_tz_map, country_name_map, config, title, subtitle = NULL) {
   #' Create faceted time-of-day heatmap
   #' Each country is shown in its LOCAL timezone
   #'
   #' @param agg_data Aggregated data by country and time_slot
   #' @param country_order Vector of country codes in display order
   #' @param country_tz_map Named vector mapping country -> timezone name
+  #' @param country_name_map Named vector mapping ISO3 -> full country name
   #' @param config Configuration list
   #' @param title Plot title
   #' @param subtitle Plot subtitle
@@ -742,22 +778,41 @@ create_tod_heatmap <- function(agg_data, country_order, country_tz_map, config, 
     group_by(country) %>%
     summarise(total = sum(minutes), .groups = "drop") %>%
     mutate(
+      # Get full country name
+      country_name = sapply(as.character(country), function(iso) {
+        if (iso %in% names(country_name_map)) country_name_map[[iso]] else iso
+      }),
       tz_name = country_tz_map[as.character(country)],
-      # Simplify timezone name for display (e.g., "Asia/Tehran" -> "Tehran")
-      tz_short = sapply(tz_name, function(tz) {
-        if (is.na(tz)) return("UTC")
-        parts <- strsplit(tz, "/")[[1]]
-        tail(parts, 1)
+      # Get UTC offset for each timezone (use current date as reference)
+      utc_offset = sapply(tz_name, function(tz) {
+        if (is.na(tz)) return(0)
+        tryCatch({
+          offset_info <- tz_offset(Sys.Date(), tz)
+          offset_info$utc_offset_h
+        }, error = function(e) 0)
+      }),
+      # Format as "UTC+X" or "UTC-X"
+      utc_str = sapply(utc_offset, function(off) {
+        if (off == 0) return("UTC")
+        sign_str <- ifelse(off > 0, "+", "")
+        # Handle fractional offsets nicely (e.g., 3.5 -> "+3:30")
+        if (off == floor(off)) {
+          paste0("UTC", sign_str, off)
+        } else {
+          hours <- floor(abs(off))
+          mins <- round((abs(off) - hours) * 60)
+          paste0("UTC", sign_str, ifelse(off < 0, "-", ""), hours, ":", sprintf("%02d", mins))
+        }
       })
     )
   
-  # Facet labels with total time AND timezone
+  # Facet labels with full country name, total time, AND UTC offset
   facet_labels <- setNames(
-    paste0(country_info$country, " (", 
+    paste0(country_info$country_name, " (", 
            ifelse(country_info$total >= 60, 
                   paste0(round(country_info$total / 60, 1), " hrs"),
                   paste0(round(country_info$total, 0), " min")),
-           ")\n", country_info$tz_short),
+           ")\n", country_info$utc_str),
     country_info$country
   )
   
@@ -801,6 +856,318 @@ create_tod_heatmap <- function(agg_data, country_order, country_tz_map, config, 
     )
   
   return(p)
+}
+
+create_dow_heatmap_vertical <- function(agg_data, country_order, country_name_map, config, title, subtitle = NULL) {
+  #' Create vertically stacked day-of-week heatmap
+  #' Each facet has its own x-axis day labels for easy reading
+  #' Uses patchwork to stack individual plots
+  
+  day_labels <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+  
+  countries_to_plot <- head(country_order, config$max_countries)
+  
+  plot_data <- agg_data %>%
+    filter(country %in% countries_to_plot) %>%
+    mutate(
+      country = factor(country, levels = countries_to_plot),
+      day_of_week = factor(day_of_week, levels = 1:7, labels = day_labels)
+    )
+  
+  plot_data <- plot_data %>%
+    complete(country, day_of_week, fill = list(minutes = 0))
+  
+  # Calculate totals for labels
+  country_totals <- plot_data %>%
+    group_by(country) %>%
+    summarise(total = sum(minutes), .groups = "drop") %>%
+    mutate(
+      country_name = sapply(as.character(country), function(iso) {
+        if (iso %in% names(country_name_map)) country_name_map[[iso]] else iso
+      })
+    )
+  
+  max_minutes <- max(plot_data$minutes, na.rm = TRUE)
+  
+  # Create individual plot for each country
+  plot_list <- list()
+  
+  for (i in seq_along(countries_to_plot)) {
+    ctry <- countries_to_plot[i]
+    ctry_info <- country_totals[country_totals$country == ctry, ]
+    ctry_data <- plot_data[plot_data$country == ctry, ]
+    
+    # Create label for y-axis
+    y_label <- paste0(ctry_info$country_name, " (", 
+                      ifelse(ctry_info$total >= 60, 
+                             paste0(round(ctry_info$total / 60, 1), " hrs"),
+                             paste0(round(ctry_info$total, 0), " min")),
+                      ")")
+    
+    p <- ggplot(ctry_data, aes(x = day_of_week, y = 1, fill = minutes)) +
+      geom_tile(color = config$grid_color, linewidth = 0.5) +
+      geom_text(aes(label = ifelse(minutes > 0, 
+                                    ifelse(minutes >= 1, round(minutes), 
+                                           sprintf("%.1f", minutes)), 
+                                    "")),
+                color = config$text_color, size = 3) +
+      scale_fill_gradientn(
+        colors = config$heatmap_colors,
+        limits = c(0, max_minutes),
+        name = "Minutes"
+      ) +
+      scale_y_continuous(
+        breaks = 1,
+        labels = y_label,
+        expand = c(0, 0)
+      ) +
+      labs(x = NULL, y = NULL) +
+      theme_minimal() +
+      theme(
+        plot.background = element_rect(fill = config$background_color, color = NA),
+        panel.background = element_rect(fill = config$background_color, color = NA),
+        panel.grid = element_blank(),
+        axis.text.x = element_text(color = config$text_color, size = 9),
+        axis.text.y = element_text(color = config$text_color, size = 9, face = "bold", hjust = 1),
+        axis.ticks = element_blank(),
+        legend.position = "none",
+        plot.margin = margin(t = 2, r = 5, b = 2, l = 5)
+      )
+    
+    plot_list[[i]] <- p
+  }
+  
+  # Create a separate legend plot
+  legend_plot <- ggplot(plot_data, aes(x = day_of_week, y = 1, fill = minutes)) +
+    geom_tile() +
+    scale_fill_gradientn(
+      colors = config$heatmap_colors,
+      limits = c(0, max_minutes),
+      name = "Minutes"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.background = element_rect(fill = config$background_color, color = NA),
+      legend.text = element_text(color = config$text_color),
+      legend.title = element_text(color = config$text_color),
+      legend.position = "bottom"
+    ) +
+    guides(fill = guide_colorbar(barwidth = 15, barheight = 0.5))
+  
+  # Extract just the legend
+  legend_grob <- cowplot::get_legend(legend_plot)
+  
+  # Stack all plots vertically (DOW)
+  combined <- wrap_plots(plot_list, ncol = 1)
+  
+  # Create title as a separate text grob
+  title_grob <- cowplot::ggdraw() +
+    cowplot::draw_label(title, x = 0.02, hjust = 0, fontface = "bold", size = 14, 
+                        color = config$text_color) +
+    theme(plot.background = element_rect(fill = config$background_color, color = NA))
+  
+  subtitle_grob <- NULL
+  if (!is.null(subtitle)) {
+    subtitle_grob <- cowplot::ggdraw() +
+      cowplot::draw_label(subtitle, x = 0.02, hjust = 0, size = 10, color = "#aaaaaa") +
+      theme(plot.background = element_rect(fill = config$background_color, color = NA))
+  }
+  
+  # Combine title, subtitle, plots, and legend
+  if (!is.null(subtitle_grob)) {
+    final_plot <- cowplot::plot_grid(
+      title_grob,
+      subtitle_grob,
+      combined,
+      legend_grob,
+      ncol = 1,
+      rel_heights = c(0.04, 0.03, 1, 0.05)
+    )
+  } else {
+    final_plot <- cowplot::plot_grid(
+      title_grob,
+      combined,
+      legend_grob,
+      ncol = 1,
+      rel_heights = c(0.04, 1, 0.05)
+    )
+  }
+  
+  # Wrap in ggplot for consistent return type
+  final_plot <- cowplot::ggdraw(final_plot) +
+    theme(plot.background = element_rect(fill = config$background_color, color = NA))
+  
+  return(final_plot)
+}
+
+create_tod_heatmap_vertical <- function(agg_data, country_order, country_tz_map, country_name_map, config, title, subtitle = NULL) {
+  #' Create vertically stacked time-of-day heatmap
+  #' Each facet has its own x-axis time labels for easy reading
+  #' Uses patchwork to stack individual plots
+  
+  if (!requireNamespace("patchwork", quietly = TRUE)) {
+    install.packages("patchwork")
+  }
+  library(patchwork)
+  
+  time_labels <- sprintf("%02d:00", seq(0, 24, by = 4))
+  time_breaks <- seq(0, 48, by = 8)
+  
+  countries_to_plot <- head(country_order, config$max_countries)
+  
+  plot_data <- agg_data %>%
+    filter(country %in% countries_to_plot) %>%
+    mutate(country = factor(country, levels = countries_to_plot))
+  
+  all_slots <- expand.grid(
+    country = factor(countries_to_plot, levels = countries_to_plot),
+    time_slot = 0:47
+  )
+  
+  plot_data <- all_slots %>%
+    left_join(plot_data, by = c("country", "time_slot")) %>%
+    replace_na(list(minutes = 0))
+  
+  # Calculate totals and get timezone info for facet labels
+  country_info <- plot_data %>%
+    group_by(country) %>%
+    summarise(total = sum(minutes), .groups = "drop") %>%
+    mutate(
+      country_name = sapply(as.character(country), function(iso) {
+        if (iso %in% names(country_name_map)) country_name_map[[iso]] else iso
+      }),
+      tz_name = country_tz_map[as.character(country)],
+      utc_offset = sapply(tz_name, function(tz) {
+        if (is.na(tz)) return(0)
+        tryCatch({
+          offset_info <- tz_offset(Sys.Date(), tz)
+          offset_info$utc_offset_h
+        }, error = function(e) 0)
+      }),
+      utc_str = sapply(utc_offset, function(off) {
+        if (off == 0) return("UTC")
+        sign_str <- ifelse(off > 0, "+", "")
+        if (off == floor(off)) {
+          paste0("UTC", sign_str, off)
+        } else {
+          hours <- floor(abs(off))
+          mins <- round((abs(off) - hours) * 60)
+          paste0("UTC", sign_str, ifelse(off < 0, "-", ""), hours, ":", sprintf("%02d", mins))
+        }
+      })
+    )
+  
+  max_minutes <- max(plot_data$minutes, na.rm = TRUE)
+  
+  # Create individual plot for each country
+  plot_list <- list()
+  
+  for (i in seq_along(countries_to_plot)) {
+    ctry <- countries_to_plot[i]
+    ctry_info <- country_info[country_info$country == ctry, ]
+    ctry_data <- plot_data[plot_data$country == ctry, ]
+    
+    # Create label for y-axis
+    y_label <- paste0(ctry_info$country_name, " (", 
+                      ifelse(ctry_info$total >= 60, 
+                             paste0(round(ctry_info$total / 60, 1), " hrs"),
+                             paste0(round(ctry_info$total, 0), " min")),
+                      ") ", ctry_info$utc_str)
+    
+    p <- ggplot(ctry_data, aes(x = time_slot, y = 1, fill = minutes)) +
+      geom_tile(color = NA) +
+      scale_fill_gradientn(
+        colors = config$heatmap_colors,
+        limits = c(0, max_minutes),
+        name = "Minutes"
+      ) +
+      scale_x_continuous(
+        breaks = time_breaks,
+        labels = time_labels,
+        expand = c(0, 0)
+      ) +
+      scale_y_continuous(
+        breaks = 1,
+        labels = y_label,
+        expand = c(0, 0)
+      ) +
+      labs(x = NULL, y = NULL) +
+      theme_minimal() +
+      theme(
+        plot.background = element_rect(fill = config$background_color, color = NA),
+        panel.background = element_rect(fill = config$background_color, color = NA),
+        panel.grid = element_blank(),
+        axis.text.x = element_text(color = config$text_color, size = 7),
+        axis.text.y = element_text(color = config$text_color, size = 9, face = "bold", hjust = 1),
+        axis.ticks = element_blank(),
+        legend.position = "none",
+        plot.margin = margin(t = 2, r = 5, b = 2, l = 5)
+      )
+    
+    plot_list[[i]] <- p
+  }
+  
+  # Create a separate legend plot
+  legend_plot <- ggplot(plot_data, aes(x = time_slot, y = 1, fill = minutes)) +
+    geom_tile() +
+    scale_fill_gradientn(
+      colors = config$heatmap_colors,
+      limits = c(0, max_minutes),
+      name = "Minutes"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.background = element_rect(fill = config$background_color, color = NA),
+      legend.text = element_text(color = config$text_color),
+      legend.title = element_text(color = config$text_color),
+      legend.position = "bottom"
+    ) +
+    guides(fill = guide_colorbar(barwidth = 15, barheight = 0.5))
+  
+  # Extract just the legend
+  legend_grob <- cowplot::get_legend(legend_plot)
+  
+  # Stack all plots vertically (TOD)
+  combined <- wrap_plots(plot_list, ncol = 1)
+  
+  # Create title as a separate text grob
+  title_grob <- cowplot::ggdraw() +
+    cowplot::draw_label(title, x = 0.02, hjust = 0, fontface = "bold", size = 14, 
+                        color = config$text_color) +
+    theme(plot.background = element_rect(fill = config$background_color, color = NA))
+  
+  subtitle_grob <- NULL
+  if (!is.null(subtitle)) {
+    subtitle_grob <- cowplot::ggdraw() +
+      cowplot::draw_label(subtitle, x = 0.02, hjust = 0, size = 10, color = "#aaaaaa") +
+      theme(plot.background = element_rect(fill = config$background_color, color = NA))
+  }
+  
+  # Combine title, subtitle, plots, and legend
+  if (!is.null(subtitle_grob)) {
+    final_plot <- cowplot::plot_grid(
+      title_grob,
+      subtitle_grob,
+      combined,
+      legend_grob,
+      ncol = 1,
+      rel_heights = c(0.04, 0.03, 1, 0.05)
+    )
+  } else {
+    final_plot <- cowplot::plot_grid(
+      title_grob,
+      combined,
+      legend_grob,
+      ncol = 1,
+      rel_heights = c(0.04, 1, 0.05)
+    )
+  }
+  
+  # Wrap in ggplot for consistent return type
+  final_plot <- cowplot::ggdraw(final_plot) +
+    theme(plot.background = element_rect(fill = config$background_color, color = NA))
+  
+  return(final_plot)
 }
 
 # ------------------------------------------------------------------------------
@@ -849,6 +1216,9 @@ run_temporal_analysis <- function(config, col_map) {
   
   results <- list(plots = list(), output_files = list())
   
+  # Get country name lookup (ISO3 -> full name)
+  country_name_map <- get_country_names()
+  
   # Build subtitle from filter description
   if (!is.null(config$mission_ids)) {
     filter_desc <- paste("Missions:", paste(config$mission_ids, collapse = ", "))
@@ -893,17 +1263,36 @@ run_temporal_analysis <- function(config, col_map) {
       dow_agg <- aggregate_by_country_dow(vuefast_data, is_clipmarks = FALSE)
       
       if (nrow(dow_agg) > 0) {
-        p_dow <- create_dow_heatmap(
-          dow_agg, 
-          country_order, 
-          config,
-          title = "Dwell Time by Day of Week - Aircraft Position",
-          subtitle = filter_desc
-        )
+        # Choose layout based on config
+        if (isTRUE(config$vertical_layout)) {
+          p_dow <- create_dow_heatmap_vertical(
+            dow_agg, 
+            country_order,
+            country_name_map,
+            config,
+            title = "Dwell Time by Day of Week - Aircraft Position",
+            subtitle = filter_desc
+          )
+          # Adjust dimensions for vertical layout
+          n_countries <- min(length(country_order), config$max_countries)
+          save_height <- max(6, n_countries * 1.2)
+          save_width <- 10
+        } else {
+          p_dow <- create_dow_heatmap(
+            dow_agg, 
+            country_order,
+            country_name_map,
+            config,
+            title = "Dwell Time by Day of Week - Aircraft Position",
+            subtitle = filter_desc
+          )
+          save_height <- config$output_height
+          save_width <- config$output_width
+        }
         
         output_file <- generate_temporal_filename(config, "dow_vuefast")
         ggsave(output_file, plot = p_dow, 
-               width = config$output_width, height = config$output_height, 
+               width = save_width, height = save_height, 
                dpi = config$output_dpi)
         cli_alert_success("Saved: {output_file}")
         
@@ -917,18 +1306,38 @@ run_temporal_analysis <- function(config, col_map) {
       tod_agg <- aggregate_by_country_tod(vuefast_data, is_clipmarks = FALSE)
       
       if (nrow(tod_agg) > 0) {
-        p_tod <- create_tod_heatmap(
-          tod_agg,
-          country_order,
-          country_tz_map,
-          config,
-          title = "Dwell Time by Time of Day (30-min slots) - Aircraft Position",
-          subtitle = paste0(filter_desc, " | Local time with DST")
-        )
+        # Choose layout based on config
+        if (isTRUE(config$vertical_layout)) {
+          p_tod <- create_tod_heatmap_vertical(
+            tod_agg,
+            country_order,
+            country_tz_map,
+            country_name_map,
+            config,
+            title = "Dwell Time by Time of Day (30-min slots) - Aircraft Position",
+            subtitle = paste0(filter_desc, " | Local time")
+          )
+          # Adjust dimensions for vertical layout
+          n_countries <- min(length(country_order), config$max_countries)
+          save_height <- max(6, n_countries * 1.2)
+          save_width <- 12
+        } else {
+          p_tod <- create_tod_heatmap(
+            tod_agg,
+            country_order,
+            country_tz_map,
+            country_name_map,
+            config,
+            title = "Dwell Time by Time of Day (30-min slots) - Aircraft Position",
+            subtitle = paste0(filter_desc, " | Local time")
+          )
+          save_height <- config$output_height
+          save_width <- config$output_width
+        }
         
         output_file <- generate_temporal_filename(config, "tod_vuefast")
         ggsave(output_file, plot = p_tod,
-               width = config$output_width, height = config$output_height,
+               width = save_width, height = save_height,
                dpi = config$output_dpi)
         cli_alert_success("Saved: {output_file}")
         
@@ -971,17 +1380,36 @@ run_temporal_analysis <- function(config, col_map) {
       dow_agg <- aggregate_by_country_dow(clipmarks_data, is_clipmarks = TRUE)
       
       if (nrow(dow_agg) > 0) {
-        p_dow <- create_dow_heatmap(
-          dow_agg,
-          country_order,
-          config,
-          title = "Collection Time by Day of Week - Clipmarks",
-          subtitle = filter_desc
-        )
+        # Choose layout based on config
+        if (isTRUE(config$vertical_layout)) {
+          p_dow <- create_dow_heatmap_vertical(
+            dow_agg,
+            country_order,
+            country_name_map,
+            config,
+            title = "Collection Time by Day of Week - Clipmarks",
+            subtitle = filter_desc
+          )
+          # Adjust dimensions for vertical layout
+          n_countries <- min(length(country_order), config$max_countries)
+          save_height <- max(6, n_countries * 1.2)
+          save_width <- 10
+        } else {
+          p_dow <- create_dow_heatmap(
+            dow_agg,
+            country_order,
+            country_name_map,
+            config,
+            title = "Collection Time by Day of Week - Clipmarks",
+            subtitle = filter_desc
+          )
+          save_height <- config$output_height
+          save_width <- config$output_width
+        }
         
         output_file <- generate_temporal_filename(config, "dow_clipmarks")
         ggsave(output_file, plot = p_dow,
-               width = config$output_width, height = config$output_height,
+               width = save_width, height = save_height,
                dpi = config$output_dpi)
         cli_alert_success("Saved: {output_file}")
         
@@ -995,18 +1423,38 @@ run_temporal_analysis <- function(config, col_map) {
       tod_agg <- aggregate_by_country_tod(clipmarks_data, is_clipmarks = TRUE)
       
       if (nrow(tod_agg) > 0) {
-        p_tod <- create_tod_heatmap(
-          tod_agg,
-          country_order,
-          country_tz_map,
-          config,
-          title = "Collection Time by Time of Day (30-min slots) - Clipmarks",
-          subtitle = paste0(filter_desc, " | Local time with DST")
-        )
+        # Choose layout based on config
+        if (isTRUE(config$vertical_layout)) {
+          p_tod <- create_tod_heatmap_vertical(
+            tod_agg,
+            country_order,
+            country_tz_map,
+            country_name_map,
+            config,
+            title = "Collection Time by Time of Day (30-min slots) - Clipmarks",
+            subtitle = paste0(filter_desc, " | Local time")
+          )
+          # Adjust dimensions for vertical layout
+          n_countries <- min(length(country_order), config$max_countries)
+          save_height <- max(6, n_countries * 1.2)
+          save_width <- 12
+        } else {
+          p_tod <- create_tod_heatmap(
+            tod_agg,
+            country_order,
+            country_tz_map,
+            country_name_map,
+            config,
+            title = "Collection Time by Time of Day (30-min slots) - Clipmarks",
+            subtitle = paste0(filter_desc, " | Local time")
+          )
+          save_height <- config$output_height
+          save_width <- config$output_width
+        }
         
         output_file <- generate_temporal_filename(config, "tod_clipmarks")
         ggsave(output_file, plot = p_tod,
-               width = config$output_width, height = config$output_height,
+               width = save_width, height = save_height,
                dpi = config$output_dpi)
         cli_alert_success("Saved: {output_file}")
         
