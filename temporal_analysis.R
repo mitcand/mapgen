@@ -55,7 +55,7 @@ config <- list(
   # === DATA SOURCE ===
   data_dir = "data/missions",           # Folder containing CSV files
   db_path = "missions.duckdb",          # DuckDB database path (created automatically)
-  use_existing_db = FALSE,              # TRUE = reuse existing DB, FALSE = reimport CSVs
+  use_existing_db = TRUE,              # TRUE = reuse existing DB, FALSE = reimport CSVs
   
   # === QUERY FILTERS ===
   # Use ONE of these approaches to filter data:
@@ -65,8 +65,11 @@ config <- list(
   date_start = NULL,                    # e.g., "2024-01-01" or NULL
   date_end = NULL,                      # e.g., "2024-03-31" or NULL
   
-  # === DATA PARAMETERS ===
-  sample_rate_hz = 15,                  # Vuefast data sample rate in Hz (samples per second)
+  # === DWELL TIME BUCKETS ===
+  # Defines the buckets for categorizing dwell time. Creates N+1 categories.
+  # Example: c(0.5, 2, 5, 10) creates: <0.5, 0.5-2, 2-5, 5-10, >10 min
+  # Match these to your hexbin_dwell_analysis.R config for consistency
+  time_breaks_minutes = c(1, 15, 30, 60),
   
   # === TIMEZONE LOOKUP ===
   # Method for looking up timezones from coordinates (via lutz package)
@@ -82,7 +85,9 @@ config <- list(
   facet_cols_tod = 3,                   # Number of columns for time-of-day grid layout
   
   # === COLORS ===
-  # Heatmap colors (low to high dwell time) - gradient for time intensity
+  # Heatmap colors for each bucket (low to high dwell time)
+  # Must have exactly length(time_breaks_minutes) + 1 colors
+  # Default matches hexbin_dwell_analysis.R colors
   heatmap_colors = c("#285DAB", "#5EA5DA", "#F1DCAA", "#F9A63F", "#CD5821"),
   
   # Background styling (dark theme to match hexbin maps)
@@ -562,8 +567,10 @@ add_local_time_components <- function(data, timestamp_col = "timestamp_utc") {
   return(data)
 }
 
-aggregate_by_country_dow <- function(data, sample_rate_hz = 15, is_clipmarks = FALSE) {
+aggregate_by_country_dow <- function(data, is_clipmarks = FALSE) {
+
   #' Aggregate data by country and day of week
+  #' Uses actual timestamp differences to calculate dwell time
   
   if (is_clipmarks) {
     agg <- data %>%
@@ -571,19 +578,28 @@ aggregate_by_country_dow <- function(data, sample_rate_hz = 15, is_clipmarks = F
       group_by(country, day_of_week) %>%
       summarise(minutes = sum(duration_minutes, na.rm = TRUE), .groups = "drop")
   } else {
+    # Calculate time differences between consecutive points within each group
     agg <- data %>%
       filter(!is.na(country)) %>%
+      arrange(timestamp_utc) %>%
       group_by(country, day_of_week) %>%
-      summarise(n_samples = n(), .groups = "drop") %>%
-      mutate(minutes = n_samples / sample_rate_hz / 60) %>%
-      select(country, day_of_week, minutes)
+      summarise(
+        # Sum of time gaps between consecutive points, capped at 1 minute max per gap
+        # to avoid counting large gaps (e.g., between missions)
+        minutes = sum(pmin(
+          as.numeric(difftime(lead(timestamp_utc), timestamp_utc, units = "mins")),
+          1  # Cap at 1 minute per gap
+        ), na.rm = TRUE),
+        .groups = "drop"
+      )
   }
   
   return(agg)
 }
 
-aggregate_by_country_tod <- function(data, sample_rate_hz = 15, is_clipmarks = FALSE) {
+aggregate_by_country_tod <- function(data, is_clipmarks = FALSE) {
   #' Aggregate data by country and time of day slot
+  #' Uses actual timestamp differences to calculate dwell time
   
   if (is_clipmarks) {
     agg <- data %>%
@@ -591,19 +607,27 @@ aggregate_by_country_tod <- function(data, sample_rate_hz = 15, is_clipmarks = F
       group_by(country, time_slot) %>%
       summarise(minutes = sum(duration_minutes, na.rm = TRUE), .groups = "drop")
   } else {
+    # Calculate time differences between consecutive points within each group
     agg <- data %>%
       filter(!is.na(country)) %>%
+      arrange(timestamp_utc) %>%
       group_by(country, time_slot) %>%
-      summarise(n_samples = n(), .groups = "drop") %>%
-      mutate(minutes = n_samples / sample_rate_hz / 60) %>%
-      select(country, time_slot, minutes)
+      summarise(
+        # Sum of time gaps between consecutive points, capped at 1 minute max per gap
+        minutes = sum(pmin(
+          as.numeric(difftime(lead(timestamp_utc), timestamp_utc, units = "mins")),
+          1  # Cap at 1 minute per gap
+        ), na.rm = TRUE),
+        .groups = "drop"
+      )
   }
   
   return(agg)
 }
 
-get_country_totals <- function(data, is_clipmarks = FALSE, sample_rate_hz = 15) {
+get_country_totals <- function(data, is_clipmarks = FALSE) {
   #' Get total time per country for ordering facets
+  #' Uses actual timestamp differences to calculate dwell time
   
   if (is_clipmarks) {
     totals <- data %>%
@@ -612,16 +636,59 @@ get_country_totals <- function(data, is_clipmarks = FALSE, sample_rate_hz = 15) 
       summarise(total_minutes = sum(duration_minutes, na.rm = TRUE), .groups = "drop") %>%
       arrange(desc(total_minutes))
   } else {
+    # Calculate time differences between consecutive points
     totals <- data %>%
       filter(!is.na(country)) %>%
+      arrange(timestamp_utc) %>%
       group_by(country) %>%
-      summarise(n_samples = n(), .groups = "drop") %>%
-      mutate(total_minutes = n_samples / sample_rate_hz / 60) %>%
-      arrange(desc(total_minutes)) %>%
-      select(country, total_minutes)
+      summarise(
+        total_minutes = sum(pmin(
+          as.numeric(difftime(lead(timestamp_utc), timestamp_utc, units = "mins")),
+          1  # Cap at 1 minute per gap
+        ), na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      arrange(desc(total_minutes))
   }
   
   return(totals)
+}
+
+create_dwell_buckets <- function(minutes_values, time_breaks) {
+  #' Categorize dwell time values into buckets
+  #'
+  #' @param minutes_values Numeric vector of dwell times in minutes
+
+  #' @param time_breaks Vector of break points (e.g., c(0.5, 2, 5, 10))
+  #' @return Factor with bucket categories
+  
+  # Create labels for each bucket
+  break_labels <- c(
+    paste0("<", time_breaks[1]),
+    paste0(time_breaks[-length(time_breaks)], "-", time_breaks[-1]),
+    paste0(">", time_breaks[length(time_breaks)])
+  )
+  
+  # Cut into buckets
+  cut(
+    minutes_values,
+    breaks = c(0, time_breaks, Inf),
+    labels = break_labels,
+    include.lowest = TRUE
+  )
+}
+
+get_bucket_labels <- function(time_breaks) {
+  #' Get the bucket labels for a given set of time breaks
+  #'
+  #' @param time_breaks Vector of break points
+  #' @return Character vector of bucket labels
+  
+  c(
+    paste0("<", time_breaks[1]),
+    paste0(time_breaks[-length(time_breaks)], "-", time_breaks[-1]),
+    paste0(">", time_breaks[length(time_breaks)])
+  )
 }
 
 get_country_primary_timezone <- function(data) {
@@ -663,9 +730,9 @@ get_country_names <- function() {
 # ------------------------------------------------------------------------------
 
 create_dow_heatmap <- function(agg_data, country_order, country_name_map, config, title, subtitle = NULL) {
-  #' Create faceted day-of-week heatmap
+  #' Create faceted day-of-week heatmap with discrete color buckets
   #'
- #' @param agg_data Aggregated data by country and day_of_week
+  #' @param agg_data Aggregated data by country and day_of_week
   #' @param country_order Vector of country codes in display order
   #' @param country_name_map Named vector mapping ISO3 -> full country name
   #' @param config Configuration list
@@ -689,6 +756,10 @@ create_dow_heatmap <- function(agg_data, country_order, country_name_map, config
   plot_data <- plot_data %>%
     complete(country, day_of_week, fill = list(minutes = 0))
   
+  # Create dwell time buckets
+  bucket_labels <- get_bucket_labels(config$time_breaks_minutes)
+  plot_data$dwell_category <- create_dwell_buckets(plot_data$minutes, config$time_breaks_minutes)
+  
   # Calculate totals for facet labels
   country_totals <- plot_data %>%
     group_by(country) %>%
@@ -710,9 +781,17 @@ create_dow_heatmap <- function(agg_data, country_order, country_name_map, config
     country_totals$country
   )
   
-  max_minutes <- max(plot_data$minutes, na.rm = TRUE)
+  # Validate color count matches bucket count
+  n_buckets <- length(bucket_labels)
+  n_colors <- length(config$heatmap_colors)
+  if (n_colors != n_buckets) {
+    warning(glue("heatmap_colors has {n_colors} colors but time_breaks creates {n_buckets} buckets. Using default colors."))
+    colors <- scales::hue_pal()(n_buckets)
+  } else {
+    colors <- config$heatmap_colors
+  }
   
-  p <- ggplot(plot_data, aes(x = day_of_week, y = 1, fill = minutes)) +
+  p <- ggplot(plot_data, aes(x = day_of_week, y = 1, fill = dwell_category)) +
     geom_tile(color = config$grid_color, linewidth = 0.5) +
     geom_text(aes(label = ifelse(minutes > 0, 
                                   ifelse(minutes >= 1, round(minutes), 
@@ -720,10 +799,11 @@ create_dow_heatmap <- function(agg_data, country_order, country_name_map, config
                                   "")),
               color = config$text_color, size = 3) +
     facet_wrap(~ country, ncol = config$facet_cols_dow, labeller = labeller(country = facet_labels)) +
-    scale_fill_gradientn(
-      colors = config$heatmap_colors,
-      limits = c(0, max_minutes),
-      name = "Minutes"
+    scale_fill_manual(
+      values = colors,
+      name = "Dwell Time\n(minutes)",
+      drop = FALSE,
+      na.value = config$background_color
     ) +
     labs(
       title = title,
@@ -825,15 +905,28 @@ create_tod_heatmap <- function(agg_data, country_order, country_tz_map, country_
     country_info$country
   )
   
-  max_minutes <- max(plot_data$minutes, na.rm = TRUE)
+  # Create dwell time buckets
+  bucket_labels <- get_bucket_labels(config$time_breaks_minutes)
+  plot_data$dwell_category <- create_dwell_buckets(plot_data$minutes, config$time_breaks_minutes)
   
-  p <- ggplot(plot_data, aes(x = time_slot, y = 1, fill = minutes)) +
+  # Validate color count matches bucket count
+  n_buckets <- length(bucket_labels)
+  n_colors <- length(config$heatmap_colors)
+  if (n_colors != n_buckets) {
+    warning(glue("heatmap_colors has {n_colors} colors but time_breaks creates {n_buckets} buckets. Using default colors."))
+    colors <- scales::hue_pal()(n_buckets)
+  } else {
+    colors <- config$heatmap_colors
+  }
+  
+  p <- ggplot(plot_data, aes(x = time_slot, y = 1, fill = dwell_category)) +
     geom_tile(color = NA) +
     facet_wrap(~ country, ncol = config$facet_cols_tod, labeller = labeller(country = facet_labels)) +
-    scale_fill_gradientn(
-      colors = config$heatmap_colors,
-      limits = c(0, max_minutes),
-      name = "Minutes"
+    scale_fill_manual(
+      values = colors,
+      name = "Dwell Time\n(minutes)",
+      drop = FALSE,
+      na.value = config$background_color
     ) +
     scale_x_continuous(
       breaks = time_breaks,
@@ -886,6 +979,19 @@ create_dow_heatmap_vertical <- function(agg_data, country_order, country_name_ma
   plot_data <- plot_data %>%
     complete(country, day_of_week, fill = list(minutes = 0))
   
+  # Create dwell time buckets
+  bucket_labels <- get_bucket_labels(config$time_breaks_minutes)
+  plot_data$dwell_category <- create_dwell_buckets(plot_data$minutes, config$time_breaks_minutes)
+  
+  # Validate color count matches bucket count
+  n_buckets <- length(bucket_labels)
+  n_colors <- length(config$heatmap_colors)
+  if (n_colors != n_buckets) {
+    colors <- scales::hue_pal()(n_buckets)
+  } else {
+    colors <- config$heatmap_colors
+  }
+  
   # Calculate totals for labels
   country_totals <- plot_data %>%
     group_by(country) %>%
@@ -895,8 +1001,6 @@ create_dow_heatmap_vertical <- function(agg_data, country_order, country_name_ma
         if (iso %in% names(country_name_map)) country_name_map[[iso]] else iso
       })
     )
-  
-  max_minutes <- max(plot_data$minutes, na.rm = TRUE)
   
   # Create individual plot for each country
   plot_list <- list()
@@ -913,17 +1017,18 @@ create_dow_heatmap_vertical <- function(agg_data, country_order, country_name_ma
                              paste0(round(ctry_info$total, 0), " min")),
                       ")")
     
-    p <- ggplot(ctry_data, aes(x = day_of_week, y = 1, fill = minutes)) +
+    p <- ggplot(ctry_data, aes(x = day_of_week, y = 1, fill = dwell_category)) +
       geom_tile(color = config$grid_color, linewidth = 0.5) +
       geom_text(aes(label = ifelse(minutes > 0, 
                                     ifelse(minutes >= 1, round(minutes), 
                                            sprintf("%.1f", minutes)), 
                                     "")),
                 color = config$text_color, size = 3) +
-      scale_fill_gradientn(
-        colors = config$heatmap_colors,
-        limits = c(0, max_minutes),
-        name = "Minutes"
+      scale_fill_manual(
+        values = colors,
+        name = "Dwell Time\n(minutes)",
+        drop = FALSE,
+        na.value = config$background_color
       ) +
       scale_y_continuous(
         breaks = 1,
@@ -947,12 +1052,12 @@ create_dow_heatmap_vertical <- function(agg_data, country_order, country_name_ma
   }
   
   # Create a separate legend plot
-  legend_plot <- ggplot(plot_data, aes(x = day_of_week, y = 1, fill = minutes)) +
+  legend_plot <- ggplot(plot_data, aes(x = day_of_week, y = 1, fill = dwell_category)) +
     geom_tile() +
-    scale_fill_gradientn(
-      colors = config$heatmap_colors,
-      limits = c(0, max_minutes),
-      name = "Minutes"
+    scale_fill_manual(
+      values = colors,
+      name = "Dwell Time (minutes)",
+      drop = FALSE
     ) +
     theme_minimal() +
     theme(
@@ -961,7 +1066,7 @@ create_dow_heatmap_vertical <- function(agg_data, country_order, country_name_ma
       legend.title = element_text(color = config$text_color),
       legend.position = "bottom"
     ) +
-    guides(fill = guide_colorbar(barwidth = 15, barheight = 0.5))
+    guides(fill = guide_legend(nrow = 1))
   
   # Extract just the legend
   legend_grob <- cowplot::get_legend(legend_plot)
@@ -1066,7 +1171,18 @@ create_tod_heatmap_vertical <- function(agg_data, country_order, country_tz_map,
       })
     )
   
-  max_minutes <- max(plot_data$minutes, na.rm = TRUE)
+  # Create dwell time buckets
+  bucket_labels <- get_bucket_labels(config$time_breaks_minutes)
+  plot_data$dwell_category <- create_dwell_buckets(plot_data$minutes, config$time_breaks_minutes)
+  
+  # Validate color count matches bucket count
+  n_buckets <- length(bucket_labels)
+  n_colors <- length(config$heatmap_colors)
+  if (n_colors != n_buckets) {
+    colors <- scales::hue_pal()(n_buckets)
+  } else {
+    colors <- config$heatmap_colors
+  }
   
   # Create individual plot for each country
   plot_list <- list()
@@ -1083,12 +1199,13 @@ create_tod_heatmap_vertical <- function(agg_data, country_order, country_tz_map,
                              paste0(round(ctry_info$total, 0), " min")),
                       ") ", ctry_info$utc_str)
     
-    p <- ggplot(ctry_data, aes(x = time_slot, y = 1, fill = minutes)) +
+    p <- ggplot(ctry_data, aes(x = time_slot, y = 1, fill = dwell_category)) +
       geom_tile(color = NA) +
-      scale_fill_gradientn(
-        colors = config$heatmap_colors,
-        limits = c(0, max_minutes),
-        name = "Minutes"
+      scale_fill_manual(
+        values = colors,
+        name = "Dwell Time\n(minutes)",
+        drop = FALSE,
+        na.value = config$background_color
       ) +
       scale_x_continuous(
         breaks = time_breaks,
@@ -1117,12 +1234,12 @@ create_tod_heatmap_vertical <- function(agg_data, country_order, country_tz_map,
   }
   
   # Create a separate legend plot
-  legend_plot <- ggplot(plot_data, aes(x = time_slot, y = 1, fill = minutes)) +
+  legend_plot <- ggplot(plot_data, aes(x = time_slot, y = 1, fill = dwell_category)) +
     geom_tile() +
-    scale_fill_gradientn(
-      colors = config$heatmap_colors,
-      limits = c(0, max_minutes),
-      name = "Minutes"
+    scale_fill_manual(
+      values = colors,
+      name = "Dwell Time (minutes)",
+      drop = FALSE
     ) +
     theme_minimal() +
     theme(
@@ -1131,7 +1248,7 @@ create_tod_heatmap_vertical <- function(agg_data, country_order, country_tz_map,
       legend.title = element_text(color = config$text_color),
       legend.position = "bottom"
     ) +
-    guides(fill = guide_colorbar(barwidth = 15, barheight = 0.5))
+    guides(fill = guide_legend(nrow = 1))
   
   # Extract just the legend
   legend_grob <- cowplot::get_legend(legend_plot)
@@ -1261,8 +1378,7 @@ run_temporal_analysis <- function(config, col_map) {
     vuefast_data <- add_local_time_components(vuefast_data, "timestamp_utc")
     
     # Get country order by total time
-    country_totals <- get_country_totals(vuefast_data, is_clipmarks = FALSE, 
-                                          sample_rate_hz = config$sample_rate_hz)
+    country_totals <- get_country_totals(vuefast_data, is_clipmarks = FALSE)
     country_order <- country_totals$country
     
     if (length(country_order) > 0) {
@@ -1270,8 +1386,7 @@ run_temporal_analysis <- function(config, col_map) {
       # --- 1a: Day of Week ---
       cli_h3("1a. Day of Week - Aircraft Position")
       
-      dow_agg <- aggregate_by_country_dow(vuefast_data, is_clipmarks = FALSE,
-                                           sample_rate_hz = config$sample_rate_hz)
+      dow_agg <- aggregate_by_country_dow(vuefast_data, is_clipmarks = FALSE)
       
       if (nrow(dow_agg) > 0) {
         # Choose layout based on config
@@ -1314,8 +1429,7 @@ run_temporal_analysis <- function(config, col_map) {
       # --- 2a: Time of Day ---
       cli_h3("2a. Time of Day - Aircraft Position (Local Timezones with DST)")
       
-      tod_agg <- aggregate_by_country_tod(vuefast_data, is_clipmarks = FALSE,
-                                           sample_rate_hz = config$sample_rate_hz)
+      tod_agg <- aggregate_by_country_tod(vuefast_data, is_clipmarks = FALSE)
       
       if (nrow(tod_agg) > 0) {
         # Choose layout based on config

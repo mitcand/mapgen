@@ -39,12 +39,13 @@ The script generates four faceted heatmaps:
 
 ### Key Features
 
+- **Timestamp-based dwell time** - Uses actual timestamp differences, not sample counting
+- **Discrete color buckets** - Matches hexbin_dwell_analysis.R style for visual consistency
 - **Automatic timezone lookup** from coordinates using `lutz` package
 - **Automatic DST handling** - correctly handles data spanning entire years
 - **Full country names** in facet labels with UTC offset
 - **Two layout options** - grid or vertical single-column
 - **Accurate country detection** using Natural Earth boundaries
-- **Configurable sample rate** for different sensor frequencies
 
 ---
 
@@ -81,7 +82,7 @@ The script will attempt to install missing packages automatically:
 install.packages(c(
   "DBI", "duckdb",           # Database
   "sf",                       # Spatial operations
-  "ggplot2",                  # Plotting
+  "ggplot2", "scales",        # Plotting
   "rnaturalearth",            # Country boundaries
   "rnaturalearthdata",
   "dplyr", "tidyr",           # Data manipulation
@@ -125,11 +126,20 @@ All configuration is at the top of the script in the `config` list.
 | `date_start` | `NULL` | Start date filter, e.g., `"2024-01-01"` |
 | `date_end` | `NULL` | End date filter, e.g., `"2024-03-31"` |
 
-### Data Parameters
+### Dwell Time Buckets
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `sample_rate_hz` | `15` | Vuefast data sample rate in Hz (samples per second). Used to convert sample counts to minutes. |
+| `time_breaks_minutes` | `c(0.5, 2, 5, 10)` | Break points for categorizing dwell time. Creates N+1 buckets. |
+
+**Example**: `c(0.5, 2, 5, 10)` creates these buckets:
+- `<0.5` (under 30 seconds)
+- `0.5-2` (30 sec to 2 min)
+- `2-5` (2 to 5 min)
+- `5-10` (5 to 10 min)
+- `>10` (over 10 min)
+
+**Important**: Match these to your `hexbin_dwell_analysis.R` config for visual consistency between the geographic and temporal analyses.
 
 ### Timezone Lookup
 
@@ -150,10 +160,12 @@ All configuration is at the top of the script in the `config` list.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `heatmap_colors` | `c("#285DAB", "#5EA5DA", "#F1DCAA", "#F9A63F", "#CD5821")` | Gradient colors from low to high dwell time |
+| `heatmap_colors` | `c("#285DAB", "#5EA5DA", "#F1DCAA", "#F9A63F", "#CD5821")` | Colors for each dwell time bucket (low to high). **Must have exactly `length(time_breaks_minutes) + 1` colors.** |
 | `background_color` | `"#1a1a1a"` | Plot background color |
 | `text_color` | `"#ffffff"` | Text and label color |
 | `grid_color` | `"#333333"` | Grid lines between tiles |
+
+**Note**: The default 5 colors match the default 4 time breaks (creating 5 buckets). If you change `time_breaks_minutes`, update `heatmap_colors` to have the matching count.
 
 ### Output
 
@@ -249,10 +261,21 @@ config$vertical_layout <- TRUE
 result <- run_temporal_analysis(config, col_map)
 ```
 
-### Adjust for Different Sample Rate
+### Match Hexbin Color Buckets
 
 ```r
-config$sample_rate_hz <- 10  # For 10 Hz data instead of 15 Hz
+# Use same breaks as hexbin_dwell_analysis.R
+config$time_breaks_minutes <- c(0.5, 2, 5, 10)
+config$heatmap_colors <- c("#285DAB", "#5EA5DA", "#F1DCAA", "#F9A63F", "#CD5821")
+result <- run_temporal_analysis(config, col_map)
+```
+
+### Custom Bucket Sizes
+
+```r
+# Finer granularity for shorter dwell times
+config$time_breaks_minutes <- c(0.25, 0.5, 1, 2, 5)
+config$heatmap_colors <- c("#440154", "#3b528b", "#21918c", "#5ec962", "#fde725", "#ff0000")
 result <- run_temporal_analysis(config, col_map)
 ```
 
@@ -299,11 +322,13 @@ result$output_files$dow_vuefast
 - Facet labels show full country name and total time
 - X-axis: Monday through Sunday
 - Each cell shows minutes of dwell time
+- Colors indicate dwell time bucket (legend at bottom)
 
 **Time of Day Heatmaps:**
 - Facet labels show full country name, total time, and UTC offset
 - X-axis: 00:00 to 24:00 in 30-minute slots
 - Times are LOCAL to each country
+- Colors indicate dwell time bucket (legend at bottom)
 
 **Vertical Layout:**
 - Each row has its own time/day axis labels for easy reading
@@ -357,10 +382,11 @@ Some regions return multiple overlapping timezones (e.g., "Asia/Hebron; Asia/Jer
 - Update `col_map` to match your actual CSV column names
 - Check for typos and case sensitivity
 
-### Incorrect dwell times
+### Colors don't match bucket count
 
-- Verify `config$sample_rate_hz` matches your actual data rate
-- Default is 15 Hz; adjust if your sensor runs at a different frequency
+If you see a warning about color count mismatch:
+- Count your buckets: `length(time_breaks_minutes) + 1`
+- Ensure `heatmap_colors` has exactly that many colors
 
 ### Script runs slowly
 
@@ -376,6 +402,14 @@ Some regions return multiple overlapping timezones (e.g., "Asia/Hebron; Asia/Jer
 ---
 
 ## Technical Notes
+
+### Dwell Time Calculation
+
+Dwell time is calculated from actual timestamp differences:
+1. Data is sorted by timestamp within each country/day or country/time-slot group
+2. Time difference between consecutive points is calculated
+3. Gaps are capped at 1 minute max (to avoid counting gaps between missions)
+4. This approach works regardless of actual data sample rate
 
 ### Country Assignment
 
@@ -414,9 +448,14 @@ This script works alongside `hexbin_dwell_analysis.R`:
 |--------|--------|----------|
 | Focus | Where (geography) | When (time patterns) |
 | Output | Map with hex bins | Faceted heatmaps |
+| Color Scale | Discrete buckets | Discrete buckets (same) |
 | Database | Creates DuckDB | Can reuse same DB |
 
-**Workflow tip**: Run hexbin first to identify countries of interest, then run temporal to understand when activity occurred.
+**Workflow tip**: 
+1. Set matching `time_breaks_minutes` and `heatmap_colors` in both scripts
+2. Run hexbin first to identify countries of interest
+3. Run temporal to understand when activity occurred
+4. Both analyses use consistent color coding for easy comparison
 
 ---
 
